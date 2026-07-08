@@ -1,0 +1,90 @@
+# X-1 压测: LORA + standard + TP2×DP2 + ZeRO-1 (已知正确参照)
+# 目标: 验证 TP+ZeRO-2/3 replicated 参数梯度同步修复 (TP-AllReduce -> DP-ReduceScatter)
+# world_size = tp_size(2) * dp_size(2) = 4
+#
+# Usage:
+#   torchrun --nproc_per_node=4 scripts/run_colocate.py --config configs/experiments/x1_verify/lora_standard_tp2_dp2_zero1.yaml --inference-backend custom
+
+experiment:
+  name: "lora_standard_tp2_dp2_zero2"
+  stage: "sft"
+  seed: 42
+  output_dir: "outputs/x1_verify/zero2"
+
+runtime:
+  device: "auto"
+  precision: "bf16"
+  tp_size: 2
+  dp_size: 2
+  inference_backend: "custom"
+  deterministic: false
+  enable_comm_overlap: false
+
+model:
+  name_or_path: "./models/Qwen3-4B"
+  max_seq_len: 1024
+  trust_remote_code: true
+  use_flash_attn: false
+  attention_backend: "standard"
+
+data:
+  dataset_name: "yahma/alpaca-cleaned"
+  dataset_config: null
+  split: "train"
+  max_samples: 1000
+  prompt_template: "qwen3_instruction"
+  prompt_field: "instruction"
+  input_field: "input"
+  response_field: "output"
+  answer_field: null
+
+training:
+  mode: "sft"
+  total_iterations: 80
+  batch_size: 8
+  train_steps_per_iteration: 1
+  gradient_accumulation_steps: 1
+  learning_rate: 2.0e-5
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  lr_scheduler: "cosine"
+  warmup_steps: 5
+  min_lr_ratio: 0.1
+  zero_stage: 2
+
+lora:
+  enabled: true
+  rank: 32
+  alpha: 64
+  dropout: 0.05
+  target_modules:
+    - "q_proj"
+    - "k_proj"
+    - "v_proj"
+    - "o_proj"
+    - "gate_proj"
+    - "up_proj"
+    - "down_proj"
+
+distributed:
+  zero_stage: 2
+
+inference_preview:
+  enabled: false
+  max_tokens: 1
+  temperature: 0.7
+  top_p: 0.95
+
+eval:
+  max_tokens: 1
+  num_prompts: 0
+
+checkpoint:
+  save_dir: "checkpoints/x1_verify/zero2"
+  save_interval: 9999
+  save_enabled: false
+  resume_from: null
+
+profiling:
+  enabled: false
+  interval: 10

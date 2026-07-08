@@ -56,11 +56,13 @@ class ColocateConfig:
     # 模型
     model_path: str = "Qwen/Qwen3-4B"
     tp_size: int = 1
-    pp_size: int = 1  # Pipeline Parallelism 度（预留，当前未实现）
+    pp_size: int = 1  # Pipeline Parallelism 度（>1 启用 1F1B 流水线，本期仅 SFT + zero_stage<=1）
+    num_micro_batches: int = 1  # PP micro-batch 数（要求 >= pp_size）
     dp_size: int = 1
     max_seq_len: int = 2048
     use_flash_attn: bool = False
     attention_backend: str = "sdpa"  # "standard" / "sdpa" / "flash_attn"
+    use_gradient_checkpoint: bool = False  # 梯度检查点：激活重算换显存
 
     # 训练
     training_mode: str = "grpo"  # "grpo" 或 "sft"
@@ -204,9 +206,12 @@ class ColocateOrchestrator:
             model_path=self.config.model_path,
             tp_size=self.config.tp_size,
             dp_size=self.config.dp_size,
+            pp_size=self.config.pp_size,
+            num_micro_batches=self.config.num_micro_batches,
             max_seq_len=self.config.max_seq_len,
             use_flash_attn=self.config.use_flash_attn,
             attention_backend=self.config.attention_backend,
+            use_gradient_checkpoint=self.config.use_gradient_checkpoint,
             lora_rank=self.config.lora_rank,
             lora_alpha=self.config.lora_alpha,
             lora_target_modules=self.config.lora_target_modules,
@@ -239,12 +244,13 @@ class ColocateOrchestrator:
         logger.info(f"TrainEngine initialized: {self._train_engine.trainable_params_count} trainable params")
 
         if self.config.inference_backend == "custom" and self.config.training_mode != "sft":
+            # 自研推理引擎
             from ..inference.engine import InferenceEngine, InferenceConfig
 
             infer_config = InferenceConfig(
                 max_num_batched_tokens=2048,
                 max_num_sequences=256,
-                enable_prefix_caching=False,
+                enable_prefix_caching=False,  # GSM8K场景不prefix复用，默认关闭
                 enable_cuda_graph=True,
             )
             self._custom_engine = InferenceEngine(infer_config)
@@ -253,6 +259,7 @@ class ColocateOrchestrator:
         elif self.config.inference_backend == "custom":
             logger.info("SFT custom mode uses TrainEngine directly for local preview")
         else:
+            # vLLM客户端 + IPC传输
             self._vllm_client = VLLMClient(
                 base_url=self.config.vllm_url,
                 max_retries=self.config.max_retries,
@@ -294,6 +301,7 @@ class ColocateOrchestrator:
 
         self._memory_profiler.snapshot("after_init")
 
+        # 通信/计算 Profiling（条件创建）
         if self.config.enable_profiling:
             from ..profiling.comm_profiler import CommProfiler
             from ..profiling.compute_profiler import ComputeProfiler
@@ -499,24 +507,29 @@ class ColocateOrchestrator:
                     # MFU 估算（Megatron-LM standard）
                     # Full SFT: per_gpu_flops = forward × 3 / (tp × pp)
                     # LoRA: per_gpu_flops = forward × 2 / (tp × pp)（skip dW for frozen params）
+                    # H20 BF16 峰值 148 TFLOPS
                     mfu = 0.0
                     if self._compute_profiler is not None and elapsed > 0:
                         # 从实际模型对象动态提取架构参数
                         model = self._train_engine.model
                         num_layers = getattr(model, 'num_layers', None)
                         hidden_size = getattr(model, 'hidden_size', None)
+                        # vocab_size 从 lm_head 获取
                         lm_head = model.lm_head if hasattr(model, 'lm_head') else None
                         if lm_head is not None:
+                            # 处理 LoRA 包装: LinearWithLoRA.original_layer 是原始 Linear
                             if hasattr(lm_head, 'original_layer'):
                                 lm_head = lm_head.original_layer
                             vocab_size = lm_head.out_features if hasattr(lm_head, 'out_features') else None
                         else:
                             vocab_size = None
+                        # intermediate_size 从第一层 MLP gate_proj 获取
                         intermediate_size = None
                         if hasattr(model, 'layers') and len(model.layers) > 0:
                             layer0 = model.layers[0]
                             if hasattr(layer0, 'mlp') and hasattr(layer0.mlp, 'gate_proj'):
                                 gate_proj = layer0.mlp.gate_proj
+                                # 处理 LoRA 包装
                                 if hasattr(gate_proj, 'original_layer'):
                                     gate_proj = gate_proj.original_layer
                                 intermediate_size = gate_proj.out_features if hasattr(gate_proj, 'out_features') else None
@@ -919,18 +932,22 @@ class ColocateOrchestrator:
             model = self._train_engine.model
             num_layers = getattr(model, 'num_layers', None)
             hidden_size = getattr(model, 'hidden_size', None)
+            # vocab_size 从 lm_head 获取
             lm_head = model.lm_head if hasattr(model, 'lm_head') else None
             if lm_head is not None:
+                # 处理 LoRA 包装: LinearWithLoRA.original_layer 是原始 Linear
                 if hasattr(lm_head, 'original_layer'):
                     lm_head = lm_head.original_layer
                 vocab_size = lm_head.out_features if hasattr(lm_head, 'out_features') else None
             else:
                 vocab_size = None
+            # intermediate_size 从第一层 MLP gate_proj 获取
             intermediate_size = None
             if hasattr(model, 'layers') and len(model.layers) > 0:
                 layer0 = model.layers[0]
                 if hasattr(layer0, 'mlp') and hasattr(layer0.mlp, 'gate_proj'):
                     gate_proj = layer0.mlp.gate_proj
+                    # 处理 LoRA 包装
                     if hasattr(gate_proj, 'original_layer'):
                         gate_proj = gate_proj.original_layer
                     intermediate_size = gate_proj.out_features if hasattr(gate_proj, 'out_features') else None
@@ -938,6 +955,7 @@ class ColocateOrchestrator:
             # 如果模型属性不可用，从配置文件推断
             if num_layers is None or hidden_size is None or intermediate_size is None or vocab_size is None:
                 logger.warning("Model arch attributes incomplete, falling back to config-based estimation")
+                # 使用简化公式: forward_flops ≈ 2 * P * S * B
                 forward_flops = 2 * model_params * seq_len * batch_size
             else:
                 # Megatron-LM standard FLOPs 计算（不含 Attention O(n²) 项，与 6*P*B*S 近似对齐）
@@ -950,9 +968,11 @@ class ColocateOrchestrator:
                     + 3 * hidden_size * intermediate_size  # MLP SwiGLU (gate + up + down)
                 )
 
+                # 所有层 + embedding/lm_head
                 forward_flops = num_layers * per_layer_flops
                 forward_flops += 2 * batch_size * seq_len * hidden_size * vocab_size  # embedding + lm_head
 
+            # H20 BF16 峰值算力
             device_peak_tflops = 148.0
 
             # Megatron-LM standard: per_gpu_flops = forward × multiplier / (tp × pp)
@@ -974,6 +994,7 @@ class ColocateOrchestrator:
                 )
                 mfu = 99.9
 
+            # 吞吐指标
             world_size = tp_size * pp_size * dp_size
             tokens_per_second = batch_size * seq_len * world_size / avg_step_time
             samples_per_second = batch_size * world_size / avg_step_time
@@ -1011,6 +1032,7 @@ class ColocateOrchestrator:
                 mfu, tokens_per_second, samples_per_second, actual_tflops, avg_step_time
             )
 
+            # LoRA / Full SFT 指标标注（is_lora 已在上方定义）
             summary["performance"]["primary_metric"] = "tokens_per_second" if is_lora else "mfu"
 
             if is_lora:

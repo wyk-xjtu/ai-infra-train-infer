@@ -1,49 +1,50 @@
-# Minimal single-GPU SFT smoke test.
-# This config is intended for quickly validating the training loop and artifacts.
+# TP 正确性验证 — 对照：2卡 TP=2
+# 与 tp1 相同数据/seed/lr，loss 应完全一致
+#
+# Usage: torchrun --nproc_per_node=2 scripts/run_colocate.py --config configs/tp_verify_tp2.yaml --inference-backend custom
 
 experiment:
-  name: "minimal_sft_qwen3_0_6b"
+  name: "tp_verify_tp2"
   stage: "sft"
   seed: 42
-  output_dir: "outputs/minimal_sft"
+  output_dir: "outputs/tp_verify/tp2"
 
 runtime:
   device: "auto"
   precision: "bf16"
-  deterministic: false
-  tp_size: 1
+  tp_size: 2
   dp_size: 1
   inference_backend: "custom"
+  deterministic: false
   enable_comm_overlap: false
 
 model:
-  name_or_path: "./models/Qwen3-0.6B"
-  max_seq_len: 256
+  name_or_path: "./models/Qwen3-8B"
+  max_seq_len: 512
   trust_remote_code: true
   use_flash_attn: false
   attention_backend: "sdpa"
 
 data:
-  dataset_name: "openai/gsm8k"
-  dataset_config: "main"
+  dataset_name: "yahma/alpaca-cleaned"
+  dataset_config: null
   split: "train"
-  max_samples: 8
-  prompt_template: "qwen3_math"
-  prompt_field: "question"
-  input_field: null
-  response_field: "answer"
-  answer_field: "answer"
+  max_samples: 100
+  prompt_template: "qwen3_instruction"
+  prompt_field: "instruction"
+  input_field: "input"
+  response_field: "output"
+  answer_field: null
 
 training:
   mode: "sft"
-  total_iterations: 1
+  total_iterations: 50
   batch_size: 1
   train_steps_per_iteration: 1
   gradient_accumulation_steps: 1
-  learning_rate: 1.0e-5
+  learning_rate: 2.0e-5
   weight_decay: 0.01
   max_grad_norm: 1.0
-  zero_stage: 0
   lr_scheduler: "constant"
   warmup_steps: 0
   min_lr_ratio: 1.0
@@ -66,15 +67,14 @@ inference_preview:
   top_p: 0.95
 
 eval:
-  max_tokens: 64
-  num_prompts: 1
+  max_tokens: 1
+  num_prompts: 0
 
 checkpoint:
-  save_enabled: false
-  save_dir: "checkpoints/minimal_sft"
-  save_interval: 0
+  save_dir: "checkpoints/tp_verify/tp2"
+  save_interval: 9999
   resume_from: null
 
 profiling:
   enabled: false
-  interval: 10
+  interval: 100

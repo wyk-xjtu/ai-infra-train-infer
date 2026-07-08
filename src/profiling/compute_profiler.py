@@ -303,6 +303,7 @@ class ComputeProfiler:
         """
         model.eval()
 
+        # Warmup
         with torch.no_grad():
             for _ in range(num_warmup):
                 _ = model(input_ids)

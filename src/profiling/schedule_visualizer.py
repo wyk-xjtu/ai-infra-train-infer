@@ -385,6 +385,7 @@ class ScheduleVisualizer:
         lines.append(f"│  {'指标':<12} {'方案A':>10}  │  {'方案B':>10}          │")
         lines.append("├" + "─" * 27 + "┼" + "─" * 27 + "┤")
 
+        # 总时间
         time_a = stats_a.get("total_time_s", 0)
         time_b = stats_b.get("total_time_s", 0)
         lines.append(f"│  {'总时间':<10} {time_a:>8.1f}s   │  {time_b:>8.1f}s          │")

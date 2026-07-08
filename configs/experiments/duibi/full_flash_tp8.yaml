@@ -1,0 +1,108 @@
+# 对比实验: FULL + flash_attn + TP8
+# 实验目标: 收集 AI Infra 指标（显存/MFU/吞吐/通信）
+#
+# Usage:
+#   torchrun --nproc_per_node=8 scripts/run_colocate.py --config configs/experiments/duibi/full_flash_tp8.yaml --inference-backend custom
+
+experiment:
+  name: "full_flash_tp8"
+  stage: "sft"
+  seed: 42
+  output_dir: "outputs/duibi_7.7/full_flash_tp8"
+
+runtime:
+  device: "auto"
+  precision: "bf16"
+  tp_size: 8
+  dp_size: 1
+  inference_backend: "custom"
+  deterministic: false
+  enable_comm_overlap: false
+
+model:
+  name_or_path: "./models/Qwen3-4B"
+  max_seq_len: 1024
+  trust_remote_code: true
+  use_flash_attn: true
+  attention_backend: "flash_attn"
+
+data:
+  dataset_name: "yahma/alpaca-cleaned"
+  dataset_config: null
+  split: "train"
+  max_samples: 1000
+  prompt_template: "qwen3_instruction"
+  prompt_field: "instruction"
+  input_field: "input"
+  response_field: "output"
+  answer_field: null
+
+training:
+  mode: "sft"
+  total_iterations: 80
+  batch_size: 4  # 全量SFT显存紧张，使用bs=1避免OOM
+  train_steps_per_iteration: 1
+  gradient_accumulation_steps: 1
+  learning_rate: 2.0e-5
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  lr_scheduler: "cosine"
+  warmup_steps: 5
+  min_lr_ratio: 0.1
+
+lora:
+  enabled: false
+  rank: 0
+  alpha: 0
+  dropout: 0.0
+  target_modules:
+    - "q_proj"
+    - "k_proj"
+    - "v_proj"
+    - "o_proj"
+    - "gate_proj"
+    - "up_proj"
+    - "down_proj"
+
+distributed:
+  zero_stage: 0
+
+inference_preview:
+  enabled: false
+  max_tokens: 1
+  temperature: 0.7
+  top_p: 0.95
+
+eval:
+  max_tokens: 1
+  num_prompts: 0
+
+checkpoint:
+  save_dir: "checkpoints/duibi/full_flash_tp8"
+  save_interval: 9999
+  save_enabled: false
+  resume_from: null
+
+profiling:
+  enabled: true
+  interval: 10
+  memory_breakdown: true
+  compute_mfu: true
+  track_communication: true
+  metrics:
+    - peak_memory_gb
+    - model_memory_gb
+    - optimizer_memory_gb
+    - gradient_memory_gb
+    - activation_memory_gb
+    - memory_utilization_pct
+    - mfu_pct
+    - step_time_ms
+    - tokens_per_sec
+    - samples_per_sec
+    - comm_time_ratio
+    - allreduce_latency_ms
+    - comm_volume_mb
+    - loss
+    - grad_norm
+    - learning_rate

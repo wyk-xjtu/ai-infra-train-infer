@@ -1,11 +1,11 @@
-﻿[build-system]
+[build-system]
 requires = ["setuptools>=68.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "ai-infra-train-infer"
 version = "0.1.0"
-description = "AI infrastructure training, inference, and RL framework prototype with Mini-Megatron, Mini-ZeRO, and vLLM-style orchestration"
+description = "AI infra training/inference/RL framework prototype with TP, PP, ZeRO, FlashAttention, LoRA, KV cache, and GRPO"
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.10"

@@ -1,0 +1,101 @@
+# ZeRO 显存对比: Qwen3-32B 全量 SFT + standard + TP4×DP2 (world_size=8) + ZeRO-1
+# 目标: 实测三个 ZeRO stage 单卡显存是否递减 (peak / steady)
+# 前提: dp_size=2 (ZeRO 才在 dp_group 分片) + lora_rank=0 (全量, 主干才归 ZeRO 管)
+#
+# Usage:
+#   torchrun --nproc_per_node=8 scripts/run_colocate.py --config configs/experiments/zero_mem/32b_full_tp4dp2_zero1.yaml --inference-backend custom
+
+experiment:
+  name: "32b_full_tp4dp2_zero1"
+  stage: "sft"
+  seed: 42
+  output_dir: "outputs/zero_mem/zero1"
+
+runtime:
+  device: "auto"
+  precision: "bf16"
+  tp_size: 4
+  dp_size: 2
+  inference_backend: "custom"
+  deterministic: false
+  enable_comm_overlap: false
+
+model:
+  name_or_path: "./models/Qwen3-32B"
+  max_seq_len: 512
+  trust_remote_code: true
+  use_flash_attn: false
+  attention_backend: "standard"
+
+data:
+  dataset_name: "yahma/alpaca-cleaned"
+  dataset_config: null
+  split: "train"
+  max_samples: 500
+  prompt_template: "qwen3_instruction"
+  prompt_field: "instruction"
+  input_field: "input"
+  response_field: "output"
+  answer_field: null
+
+training:
+  mode: "sft"
+  total_iterations: 15
+  batch_size: 1
+  train_steps_per_iteration: 1
+  gradient_accumulation_steps: 1
+  learning_rate: 2.0e-5
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  lr_scheduler: "cosine"
+  warmup_steps: 2
+  min_lr_ratio: 0.1
+  zero_stage: 1
+
+lora:
+  enabled: false
+  rank: 0
+  alpha: 0
+  dropout: 0.0
+  target_modules:
+    - "q_proj"
+    - "k_proj"
+    - "v_proj"
+    - "o_proj"
+    - "gate_proj"
+    - "up_proj"
+    - "down_proj"
+
+distributed:
+  zero_stage: 1
+
+inference_preview:
+  enabled: false
+  max_tokens: 1
+  temperature: 0.7
+  top_p: 0.95
+
+eval:
+  max_tokens: 1
+  num_prompts: 0
+
+checkpoint:
+  save_dir: "checkpoints/zero_mem/zero1"
+  save_interval: 9999
+  save_enabled: false
+  resume_from: null
+
+profiling:
+  enabled: true
+  interval: 5
+  memory_breakdown: true
+  compute_mfu: false
+  track_communication: false
+  metrics:
+    - peak_memory_gb
+    - model_memory_gb
+    - optimizer_memory_gb
+    - gradient_memory_gb
+    - activation_memory_gb
+    - loss
+    - grad_norm

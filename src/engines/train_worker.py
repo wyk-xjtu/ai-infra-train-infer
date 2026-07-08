@@ -144,6 +144,7 @@ def _create_train_worker_class():
     return TrainWorker
 
 
+# 延迟创建，避免import时ray未初始化报错
 TrainWorker = None
 
 

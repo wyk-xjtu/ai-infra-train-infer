@@ -30,7 +30,6 @@ from .model_runner import ModelRunner, ModelRunnerConfig
 from .engine import InferenceEngine, InferenceConfig
 
 __all__ = [
-    # KV Cache
     "Block",
     "BlockPool",
     "BlockTable",

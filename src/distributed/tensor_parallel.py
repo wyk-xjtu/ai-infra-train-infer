@@ -56,9 +56,6 @@ def _divide(numerator: int, denominator: int) -> int:
     return numerator // denominator
 
 
-# RMSNorm (不做TP切分，每个rank保留完整参数)
-
-
 class RMSNorm(nn.Module):
     """Root Mean Square Layer Normalization (Qwen3 使用)
 
@@ -69,6 +66,8 @@ class RMSNorm(nn.Module):
     def __init__(self, hidden_size: int, eps: float = 1e-6):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
+        # [TP-1修复] RMSNorm 权重在各 TP rank 完整复制，标记以便梯度在 TP 组 AllReduce 同步
+        self.weight._tp_replicated = True
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -717,17 +716,58 @@ class ParallelTransformerModel(nn.Module):
         enable_comm_overlap: bool = False,
         stream_manager=None,
         attention_backend: str = "sdpa",
+        pp_context=None,
     ):
         super().__init__()
 
+        # Pipeline Parallel: stage 感知
+        # pp_context 为 None 或 pp_size==1 时，构建完整的
+        # embed→layers→norm→lm_head，行为与非 PP 版本完全一致（向后兼容）。
+        # pp_size>1 时，仅构建本 stage 的组件：
+        #   - embed_tokens 仅首 stage 持有；
+        #   - transformer 层仅持有 stage_layer_range 指定的全局层号区间；
+        #   - norm + lm_head 仅末 stage 持有；
+        #   - 其余组件置 None。
+        # 设计文档: docs/pipeline_parallel_design.md
+        self.pp_context = pp_context
+        self._pp_enabled = pp_context is not None and pp_context.pp_size > 1
+        if self._pp_enabled:
+            self.is_first_stage = pp_context.is_first_stage
+            self.is_last_stage = pp_context.is_last_stage
+            stage_start, stage_end = pp_context.stage_layer_range
+        else:
+            self.is_first_stage = True
+            self.is_last_stage = True
+            stage_start, stage_end = 0, num_layers
+        self.stage_start = stage_start
+        self.stage_end = stage_end
+        self.num_local_layers = stage_end - stage_start
+
         self.parallel_context = parallel_context
         self.hidden_size = hidden_size
-        self.num_layers = num_layers
-        self.tie_word_embeddings = tie_word_embeddings
+        self.num_layers = num_layers  # 全局总层数（用于 MFU / stage 划分）
         self.use_gradient_checkpoint = use_gradient_checkpoint
 
-        self.embed_tokens = nn.Embedding(vocab_size, hidden_size)
+        # PP MVP 限制：禁用 weight tying。
+        # 原因：首 stage 持有 embed_tokens、末 stage 持有 lm_head，二者位于
+        # 不同 rank，无法共享同一 tensor。末 stage 独立持有 lm_head 权重。
+        if self._pp_enabled and tie_word_embeddings:
+            logger.warning(
+                "[PP] tie_word_embeddings=True is not supported under pipeline "
+                "parallelism (embed_tokens on first stage, lm_head on last stage "
+                "live on different ranks). Disabling weight tying for this MVP; "
+                "the last stage holds an independent lm_head weight."
+            )
+            tie_word_embeddings = False
+        self.tie_word_embeddings = tie_word_embeddings
 
+        # Token Embedding（不切分）——仅首 stage 持有
+        if self.is_first_stage:
+            self.embed_tokens = nn.Embedding(vocab_size, hidden_size)
+        else:
+            self.embed_tokens = None
+
+        # Transformer Layers——仅构建本 stage 的层（数量 = num_local_layers）
         self.layers = nn.ModuleList([
             ParallelTransformerLayer(
                 hidden_size=hidden_size,
@@ -744,39 +784,59 @@ class ParallelTransformerModel(nn.Module):
                 overlap_comm_compute=enable_comm_overlap,
                 stream_manager=stream_manager,
             )
-            for _ in range(num_layers)
+            for _ in range(self.num_local_layers)
         ])
 
-        self.norm = RMSNorm(hidden_size, eps=rms_norm_eps)
+        # Final LayerNorm + LM Head——仅末 stage 持有
+        if self.is_last_stage:
+            self.norm = RMSNorm(hidden_size, eps=rms_norm_eps)
+            self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False)
+            # Weight tying（仅非 PP / 单 stage 时可能生效；PP 下已被禁用）
+            if tie_word_embeddings and self.embed_tokens is not None:
+                self.lm_head.weight = self.embed_tokens.weight
+        else:
+            self.norm = None
+            self.lm_head = None
 
-        self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False)
-
-        if tie_word_embeddings:
-            self.lm_head.weight = self.embed_tokens.weight
+        # [TP-2修复] embedding 与 lm_head 未做 TP 切分、在各 rank 完整复制，标记以同步梯度。
+        # 置于 weight tying 之后：即使权重共享，标记同一 tensor 也是幂等的。
+        if self.embed_tokens is not None:
+            self.embed_tokens.weight._tp_replicated = True
+        if self.lm_head is not None:
+            self.lm_head.weight._tp_replicated = True
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input,
         positions: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """
+        """Stage 感知前向。
+
         Args:
-            input_ids: [batch, seq] token IDs
+            input:
+                - 首 stage（或非 PP）: [batch, seq] token IDs
+                - 中间/末 stage: [batch, seq, hidden_size] 上游激活 hidden_states
             positions: [batch, seq] 位置索引（None 时自动生成）
             attention_mask: 可选 causal mask
 
         Returns:
-            logits: [batch, seq, vocab_size]
+            - 末 stage（或非 PP）: logits [batch, seq, vocab_size]
+            - 首/中间 stage: hidden_states [batch, seq, hidden_size]
         """
-        batch_size, seq_len = input_ids.shape
-
-        # 自动生成位置编码
-        if positions is None:
-            positions = torch.arange(seq_len, device=input_ids.device).unsqueeze(0).expand(batch_size, -1)
-
-        # Embedding
-        hidden_states = self.embed_tokens(input_ids)
+        if self.is_first_stage:
+            # 首 stage：input 为 token_ids，经 embedding 得到 hidden
+            input_ids = input
+            batch_size, seq_len = input_ids.shape
+            if positions is None:
+                positions = torch.arange(seq_len, device=input_ids.device).unsqueeze(0).expand(batch_size, -1)
+            hidden_states = self.embed_tokens(input_ids)
+        else:
+            # 中间/末 stage：input 已是上游 hidden_states
+            hidden_states = input
+            batch_size, seq_len, _ = hidden_states.shape
+            if positions is None:
+                positions = torch.arange(seq_len, device=hidden_states.device).unsqueeze(0).expand(batch_size, -1)
 
         # Transformer Layers
         # 注意: gradient checkpoint与跨层overlap不兼容（checkpoint重计算无法传递pending state）
@@ -810,25 +870,26 @@ class ParallelTransformerModel(nn.Module):
                         layer._pending_mlp_bias = None
 
         # 处理最后一层的pending MLP AllReduce（没有下一层来消费）
-        last_layer = self.layers[-1]
-        if last_layer._pending_mlp_handle is not None:
-            last_layer._pending_mlp_handle.wait()
-            hidden_states = last_layer._pending_mlp_residual + last_layer._pending_mlp_output
-            if last_layer._pending_mlp_bias is not None:
-                hidden_states = hidden_states + last_layer._pending_mlp_bias
-            # 清理状态
-            last_layer._pending_mlp_handle = None
-            last_layer._pending_mlp_residual = None
-            last_layer._pending_mlp_output = None
-            last_layer._pending_mlp_bias = None
+        # 守卫: PP 下极端切分可能出现某 stage 无层（num_local_layers==0）
+        if len(self.layers) > 0:
+            last_layer = self.layers[-1]
+            if last_layer._pending_mlp_handle is not None:
+                last_layer._pending_mlp_handle.wait()
+                hidden_states = last_layer._pending_mlp_residual + last_layer._pending_mlp_output
+                if last_layer._pending_mlp_bias is not None:
+                    hidden_states = hidden_states + last_layer._pending_mlp_bias
+                # 清理状态
+                last_layer._pending_mlp_handle = None
+                last_layer._pending_mlp_residual = None
+                last_layer._pending_mlp_output = None
+                last_layer._pending_mlp_bias = None
 
-        # Final Norm
-        hidden_states = self.norm(hidden_states)
-
-        # LM Head
-        logits = self.lm_head(hidden_states)
-
-        return logits
+        # 末 stage（或非 PP）：norm + lm_head → logits；否则返回 hidden 交给下游 stage
+        if self.is_last_stage:
+            hidden_states = self.norm(hidden_states)
+            logits = self.lm_head(hidden_states)
+            return logits
+        return hidden_states
 
 
 # HuggingFace 权重加载工具
@@ -845,6 +906,12 @@ def load_from_hf_checkpoint(
     - ColumnParallel (q_proj, k_proj, v_proj, gate_proj, up_proj): 按 dim=0 切分
     - RowParallel (o_proj, down_proj): 按 dim=1 切分
     - 其他 (embed, norm, lm_head): 不切分，直接加载
+
+    Pipeline Parallel（stage 感知）:
+    - 仅遍历 model.named_parameters()，因此非本 stage 的 embed/norm/lm_head
+      （已置 None）会自动跳过，无需额外判断。
+    - 本 stage 的 transformer 层在 named_parameters() 中是本地下标 0..N-1，
+      需通过 layer_offset = model.stage_start 映射回全局层号，再拼 HF key。
 
     Args:
         model: 已初始化的 ParallelTransformerModel
@@ -877,11 +944,13 @@ def load_from_hf_checkpoint(
     # RowParallel 权重名称模式（按 dim=1 切分）
     row_parallel_keys = {"o_proj", "down_proj"}
 
-    model_state = model.state_dict()
+    # PP stage 感知：本地层下标 → 全局层号偏移
+    layer_offset = getattr(model, "stage_start", 0)
 
     for name, param in model.named_parameters():
         # 从 HF key 映射到我们的 key（简化版：假设命名基本对齐）
-        hf_key = _map_to_hf_key(name)
+        # PP 下将本地层下标映射回全局层号
+        hf_key = _map_to_hf_key(name, layer_offset=layer_offset)
         if hf_key not in state_dict:
             print(f"[Warning] Key {hf_key} not found in checkpoint, skipping.")
             continue
@@ -907,17 +976,28 @@ def load_from_hf_checkpoint(
     print(f"[Rank {tp_rank}] Checkpoint loaded from {checkpoint_path}")
 
 
-def _map_to_hf_key(model_key: str) -> str:
+def _map_to_hf_key(model_key: str, layer_offset: int = 0) -> str:
     """将模型参数名映射到 HF checkpoint 的 key。
 
-    示例映射:
+    示例映射（layer_offset=0，非 PP）:
         layers.0.self_attn.q_proj.weight → model.layers.0.self_attn.q_proj.weight
         embed_tokens.weight → model.embed_tokens.weight
         norm.weight → model.norm.weight
         lm_head.weight → lm_head.weight
+
+    PP stage 感知（layer_offset>0）:
+        本地层下标 local_idx → 全局层号 local_idx + layer_offset。
+        例如末 stage stage_start=1 时:
+            layers.0.self_attn.q_proj.weight → model.layers.1.self_attn.q_proj.weight
     """
     if model_key.startswith("lm_head"):
         return model_key
+    # transformer 层：本地下标 → 全局层号
+    if layer_offset and model_key.startswith("layers."):
+        parts = model_key.split(".", 2)  # ["layers", "<local_idx>", "<rest>"]
+        if len(parts) == 3 and parts[1].isdigit():
+            global_idx = int(parts[1]) + layer_offset
+            return f"model.layers.{global_idx}.{parts[2]}"
     return "model." + model_key
 
 

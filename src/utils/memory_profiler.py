@@ -225,7 +225,6 @@ class MemoryBreakdown:
             )
             result["gradients_mb"] = grad_bytes / (1024 * 1024)
 
-        # 优化器状态
         if self.optimizer is not None:
             optim_bytes = 0
             for group in self.optimizer.param_groups:
@@ -296,7 +295,6 @@ class MemoryBreakdown:
             optim_bytes /= tp_size  # 简化：用tp_size近似world_size
         optim_mb = optim_bytes / (1024 * 1024)
 
-        # 梯度与可训练参数同精度（通常FP16或BF16）
         grad_bytes = trainable_params * dtype_bytes
         if zero_stage >= 2:
             grad_bytes /= tp_size
@@ -310,7 +308,6 @@ class MemoryBreakdown:
         )
         activation_mb = activation_bytes / (1024 * 1024)
 
-        # KV Cache per layer = 2 * B * S * num_kv_heads * head_dim * dtype_bytes
         kv_cache_bytes = (
             2 * num_layers * batch_size * seq_len * num_kv_heads * head_dim * dtype_bytes
         )
@@ -401,7 +398,6 @@ class MemoryBreakdown:
         if infer_mb > 0:
             lines.append(f"│  推理总计: {infer_mb/1024:.1f} GB" + " " * 21 + "│")
 
-        # 可训练参数信息
         trainable_ratio = estimate_result.get("trainable_ratio", 0)
         if trainable_ratio > 0 and trainable_ratio < 1:
             lines.append(f"│  可训练比例: {trainable_ratio:.4%} (LoRA)" + " " * 10 + "│")

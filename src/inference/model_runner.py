@@ -123,6 +123,7 @@ class ModelRunner:
             return self._run_hf_model(input_ids, positions, is_prefill)
 
         if self.model is None:
+            # Mock 模式: 返回随机 logits
             num_tokens = input_ids.shape[0]
             logits = torch.randn(num_tokens, self.config.vocab_size,
                                  device=input_ids.device, dtype=torch.float32)
@@ -620,6 +621,7 @@ class ModelRunner:
 
         for bs in reversed(batch_sizes):
             graph = torch.cuda.CUDAGraph()
+            # Warmup
             set_context(False, slot_mapping=slot_mapping[:bs],
                        context_lens=context_lens[:bs], block_tables=block_tables[:bs])
             _ = self.model(input_ids[:bs], positions=positions[:bs])

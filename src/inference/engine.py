@@ -74,7 +74,10 @@ class InferenceConfig:
     enable_chunked_prefill: bool = True
     chunk_size: int = 512
 
-    # Prefix Cache 默认关闭；GSM8K prompt 复用度低，hash 查找开销通常大于收益。
+    # 优化开关
+    # Prefix Cache默认关闭。
+    # GSM8K等数据集prompt各不相同，命中率极低，hash查找开销大于收益。
+    # 仅在对话/system_prompt复用度高的场景手动启用。
     enable_prefix_caching: bool = False
     enable_cuda_graph: bool = True
     max_cached_blocks: int = 512
@@ -97,7 +100,8 @@ class InferenceConfig:
                          block_size=16, gpu_memory_fraction=0.3, **kwargs):
         """根据GPU显存自动配置KV Cache参数
 
-        查询可用显存，按比例计算可容纳的 KV Cache block 数，避免手工配置导致 OOM。
+        查询可用显存，按比例分配给KV Cache，
+        计算可容纳的最大block数。避免手工配置导致OOM。
 
         Args:
             num_layers: transformer层数
@@ -205,7 +209,8 @@ class InferenceEngine:
         """
         cfg = self.config
 
-        # 支持旧的 use_real_model 开关，也支持新的 inference_mode 路由。
+        #   - 旧方式: use_real_model=True
+        #   - 新方式: inference_mode in ["eager", "kv_cache"]
         need_hf_model = (
             (cfg.use_real_model and self._model is None and cfg.model_path) or
             (cfg.inference_mode in ("eager", "kv_cache") and cfg.model_path and self._hf_model is None)
@@ -213,11 +218,13 @@ class InferenceEngine:
         if need_hf_model:
             self._load_hf_model(cfg.model_path)
 
-        # eager 路径不依赖 KV Cache 和 scheduler。
+        # 当使用 eager 模式时（MVP），跳过 KV Cache/Scheduler 等组件初始化
+        # 因为 _generate_real() 不依赖这些组件
         if cfg.inference_mode == "eager" or (self._hf_model is not None and cfg.inference_mode != "kv_cache"):
             self._initialized = True
             return
 
+        # mock 模式: 需要初始化全部组件
 
         dtype_map = {
             "bfloat16": torch.bfloat16,
@@ -322,6 +329,7 @@ class InferenceEngine:
             model_path,
             dtype=torch_dtype,
             trust_remote_code=True,
+            # 使用 eager attention 避免 SDPA/cuBLASLt 兼容性问题
             # (PyTorch 2.12 + CUDA 13.0 + H20 上 SDPA 触发 cublasLtGetVersion 崩溃)
             attn_implementation="eager",
         )
@@ -567,7 +575,6 @@ class InferenceEngine:
                     seq_id = request.request_id
                     success = self._kv_manager.append_token(seq_id)
                     if not success:
-                        # KV Cache OOM — 标记为需要抢占（下一步调度器处理）
                         logger.warning(
                             f"KV Cache append failed for request {request.request_id}, "
                             "marking for preemption."
@@ -636,6 +643,7 @@ class InferenceEngine:
         if hasattr(self, '_hf_model') and self._hf_model is not None:
             return self._generate_real(prompts_tokens, max_tokens, temperature)
 
+        # mock 路径: scheduler + mock 采样
         try:
             request_ids = []
             for i, tokens in enumerate(prompts_tokens):

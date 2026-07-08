@@ -40,6 +40,9 @@ import torch.nn as nn
 import torch.distributed as dist
 
 from .parallel_context import ParallelContext
+from ..utils.logger import get_logger
+
+logger = get_logger("distributed.zero_v1")
 
 
 class ZeROOptimizer:
@@ -75,10 +78,9 @@ class ZeROOptimizer:
         elif parallel_context and parallel_context.dp_size > 1:
             # DP模式：ZeRO 在 dp_group 上操作（梯度在 DP rank 间同步）
             self.group = parallel_context.dp_group
-        elif parallel_context:
-            # 纯TP模式（向后兼容）：ZeRO 在 tp_group 上操作
-            self.group = parallel_context.tp_group
         else:
+            # [X-2修复] dp_size<=1：ZeRO 退化为本地优化器（不分片）。
+            # 不再回退 tp_group，避免对 TP 切分参数做语义错误的 ReduceScatter/AllGather。
             self.group = None
 
         # 从通信组获取 world_size 和 rank
@@ -119,6 +121,13 @@ class ZeROOptimizer:
             self.padded_size, dtype=self._buffer_dtype, device=self.params[0].device
         )
 
+        logger.info(
+            "ZeROStage1Optimizer initialized: params=%d, padded=%d, shard_size=%d, "
+            "rank=%d/%d, buffer_dtype=%s",
+            self.param_count, self.padded_size, self.shard_size,
+            self.rank, self.world_size, self._buffer_dtype,
+        )
+
     def _pad_to_divisible(self, size: int, divisor: int) -> int:
         """将 size 向上对齐到 divisor 的整数倍"""
         return size + (divisor - size % divisor) % divisor
@@ -148,7 +157,7 @@ class ZeROOptimizer:
         for p in self.params:
             numel = p.numel()
             if p.grad is not None:
-                self.flat_grad[offset:offset + numel].copy_(p.grad.data.view(-1).float())
+                self.flat_grad[offset:offset + numel].copy_(p.grad.data.view(-1).to(self._buffer_dtype))
             offset += numel
 
     def step(self):

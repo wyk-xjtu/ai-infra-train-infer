@@ -131,7 +131,11 @@ class _CopyToParallelRegion(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):  # type: ignore
+        # 反向: AllReduce 梯度
         if ctx.group is not None:
+            # [TP-4修复] 先 clone 再 AllReduce，避免 gradient checkpointing(use_reentrant=False)
+            # 下 autograd 复用 grad tensor 时被原地修改覆盖。
+            grad_output = grad_output.clone()
             dist.all_reduce(grad_output, group=ctx.group)
         return grad_output, None
 
@@ -154,6 +158,7 @@ class _ReduceFromParallelRegion(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):  # type: ignore
+        # 反向: Identity，梯度直接传回
         return grad_output, None
 
 
@@ -358,3 +363,172 @@ def all_reduce_async(
     """
     async_op = AsyncAllReduce(group=group, stream_manager=stream_manager, timeout_sec=timeout_sec)
     return async_op.start(tensor)
+
+
+#
+# 设计要点:
+# - 统一使用 torch.distributed.batch_isend_irecv([P2POp...]) 后 wait()，
+#   而非裸 dist.send/dist.recv。原因：1F1B 稳态下相邻 stage 会同时
+#   "send 前向 activation" 与 "send 反向 grad"，若用同步 send/recv 且
+#   两侧都先 send，会造成双向阻塞死锁；batch_isend_irecv 会把一批
+#   收发操作打包后由后端统一调度，避免顺序依赖导致的死锁。
+# - peer（prev_rank / next_rank）为全局 rank（ParallelContext 提供的
+#   global_rank ∓ tp_size），与 torch 点对点接口的 rank 语义一致。
+#   （无法在无通信组时凭空生成远端数据）。
+
+
+def _batch_p2p(ops: list) -> None:
+    """执行一批 P2POp 并等待全部完成。"""
+    if not ops:
+        return
+    reqs = dist.batch_isend_irecv(ops)
+    for req in reqs:
+        req.wait()
+
+
+def send_forward(
+    tensor: torch.Tensor,
+    next_rank: Optional[int],
+    pp_group: Optional[ProcessGroup],
+) -> None:
+    """前向：发送 activation 到下一个 stage（next_rank）。
+
+    Args:
+        tensor: 要发送的 hidden_states
+        next_rank: 下一个 stage 的全局 rank；None（最后一个 stage）时 no-op
+        pp_group: PP 通信组；None 时 no-op
+    """
+    if pp_group is None or next_rank is None:
+        return
+    op = dist.P2POp(dist.isend, tensor.contiguous(), next_rank, group=pp_group)
+    _batch_p2p([op])
+
+
+def recv_forward(
+    shape,
+    dtype: torch.dtype,
+    device,
+    prev_rank: Optional[int],
+    pp_group: Optional[ProcessGroup],
+) -> torch.Tensor:
+    """前向：从上一个 stage（prev_rank）接收 activation。
+
+    Args:
+        shape: 接收张量的形状
+        dtype: 接收张量的 dtype
+        device: 接收张量所在设备
+        prev_rank: 上一个 stage 的全局 rank
+        pp_group: PP 通信组；None 时抛错（无通信组无法接收）
+
+    Returns:
+        接收到的张量
+    """
+    if pp_group is None:
+        raise RuntimeError(
+            "recv_forward requires a valid pp_group, but got None "
+            "(no pipeline parallel group available)."
+        )
+    tensor = torch.empty(shape, dtype=dtype, device=device)
+    op = dist.P2POp(dist.irecv, tensor, prev_rank, group=pp_group)
+    _batch_p2p([op])
+    return tensor
+
+
+def send_backward(
+    grad: torch.Tensor,
+    prev_rank: Optional[int],
+    pp_group: Optional[ProcessGroup],
+) -> None:
+    """反向：发送梯度到上一个 stage（prev_rank）。
+
+    Args:
+        grad: 要发送的 grad_hidden_states
+        prev_rank: 上一个 stage 的全局 rank；None（第一个 stage）时 no-op
+        pp_group: PP 通信组；None 时 no-op
+    """
+    if pp_group is None or prev_rank is None:
+        return
+    op = dist.P2POp(dist.isend, grad.contiguous(), prev_rank, group=pp_group)
+    _batch_p2p([op])
+
+
+def recv_backward(
+    shape,
+    dtype: torch.dtype,
+    device,
+    next_rank: Optional[int],
+    pp_group: Optional[ProcessGroup],
+) -> torch.Tensor:
+    """反向：从下一个 stage（next_rank）接收梯度。
+
+    Args:
+        shape: 接收梯度的形状
+        dtype: 接收梯度的 dtype
+        device: 接收梯度所在设备
+        next_rank: 下一个 stage 的全局 rank
+        pp_group: PP 通信组；None 时抛错（无通信组无法接收）
+
+    Returns:
+        接收到的梯度张量
+    """
+    if pp_group is None:
+        raise RuntimeError(
+            "recv_backward requires a valid pp_group, but got None "
+            "(no pipeline parallel group available)."
+        )
+    tensor = torch.empty(shape, dtype=dtype, device=device)
+    op = dist.P2POp(dist.irecv, tensor, next_rank, group=pp_group)
+    _batch_p2p([op])
+    return tensor
+
+
+def send_forward_recv_backward(
+    output_tensor: torch.Tensor,
+    grad_shape,
+    dtype: torch.dtype,
+    device,
+    next_rank: Optional[int],
+    pp_group: Optional[ProcessGroup],
+) -> Optional[torch.Tensor]:
+    """组合原语（Megatron 风格）：一次性向 next_rank 发送前向 activation，
+    同时从 next_rank 接收反向 grad。二者打包进同一 batch_isend_irecv，
+    避免稳态双向通信死锁。
+
+    Returns:
+        接收到的 grad（形状 grad_shape）；当 pp_group/next_rank 为 None 时返回 None。
+    """
+    if pp_group is None or next_rank is None:
+        return None
+    recv_grad = torch.empty(grad_shape, dtype=dtype, device=device)
+    ops = [
+        dist.P2POp(dist.isend, output_tensor.contiguous(), next_rank, group=pp_group),
+        dist.P2POp(dist.irecv, recv_grad, next_rank, group=pp_group),
+    ]
+    _batch_p2p(ops)
+    return recv_grad
+
+
+def send_backward_recv_forward(
+    input_grad: torch.Tensor,
+    act_shape,
+    dtype: torch.dtype,
+    device,
+    prev_rank: Optional[int],
+    pp_group: Optional[ProcessGroup],
+) -> Optional[torch.Tensor]:
+    """组合原语（Megatron 风格）：一次性向 prev_rank 发送反向 grad，
+    同时从 prev_rank 接收前向 activation。二者打包进同一 batch_isend_irecv，
+    避免稳态双向通信死锁。
+
+    Returns:
+        接收到的 activation（形状 act_shape）；当 pp_group/prev_rank 为 None 时返回 None。
+    """
+    if pp_group is None or prev_rank is None:
+        return None
+    recv_act = torch.empty(act_shape, dtype=dtype, device=device)
+    ops = [
+        dist.P2POp(dist.isend, input_grad.contiguous(), prev_rank, group=pp_group),
+        dist.P2POp(dist.irecv, recv_act, prev_rank, group=pp_group),
+    ]
+    _batch_p2p(ops)
+    return recv_act

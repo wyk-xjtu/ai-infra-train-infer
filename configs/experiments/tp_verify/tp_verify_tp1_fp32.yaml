@@ -1,0 +1,80 @@
+# TP 正确性验证 — 基线：1卡 TP=1
+# 对比 TP=2 的 loss 曲线是否一致（数学等价性验证）
+#
+# Usage: python scripts/run_colocate.py --config configs/tp_verify_tp1_fp32.yaml --inference-backend custom
+
+experiment:
+  name: "tp_verify_tp1_fp32"
+  stage: "sft"
+  seed: 42
+  output_dir: "outputs/tp_verify/tp1_fp32"
+
+runtime:
+  device: "auto"
+  precision: "fp32"
+  tp_size: 1
+  dp_size: 1
+  inference_backend: "custom"
+  deterministic: false
+  enable_comm_overlap: false
+
+model:
+  name_or_path: "./models/Qwen3-8B"
+  max_seq_len: 512
+  trust_remote_code: true
+  use_flash_attn: false
+  attention_backend: "sdpa"
+
+data:
+  dataset_name: "yahma/alpaca-cleaned"
+  dataset_config: null
+  split: "train"
+  max_samples: 100
+  prompt_template: "qwen3_instruction"
+  prompt_field: "instruction"
+  input_field: "input"
+  response_field: "output"
+  answer_field: null
+
+training:
+  mode: "sft"
+  total_iterations: 200
+  batch_size: 1
+  train_steps_per_iteration: 1
+  gradient_accumulation_steps: 1
+  learning_rate: 2.0e-5
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  lr_scheduler: "constant"
+  warmup_steps: 0
+  min_lr_ratio: 1.0
+
+lora:
+  enabled: true
+  rank: 8
+  alpha: 16
+  dropout: 0.0
+  target_modules:
+    - "q_proj"
+    - "k_proj"
+    - "v_proj"
+    - "o_proj"
+
+inference_preview:
+  enabled: false
+  max_tokens: 1
+  temperature: 0.7
+  top_p: 0.95
+
+eval:
+  max_tokens: 1
+  num_prompts: 0
+
+checkpoint:
+  save_dir: "checkpoints/tp_verify/tp1_fp32"
+  save_interval: 9999
+  resume_from: null
+
+profiling:
+  enabled: false
+  interval: 100

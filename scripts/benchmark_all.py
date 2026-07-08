@@ -156,18 +156,21 @@ def print_comparison(colocate_results: dict, disagg_results: dict, logger):
                 return default
         return v
 
+    # 总时间
     col_time = _get(colocate_results, "results", "total_time_s")
     dis_time = _get(disagg_results, "results", "total_time_s")
     col_str = f"{col_time:.1f}s" if isinstance(col_time, (int, float)) else col_time
     dis_str = f"{dis_time:.1f}s" if isinstance(dis_time, (int, float)) else dis_time
     logger.info(f"  {'Total time':<35} {col_str:>15} {dis_str:>15}")
 
+    # 平均迭代时间
     col_avg = _get(colocate_results, "results", "avg_iteration_time_s")
     dis_avg = _get(disagg_results, "timing", "avg_iteration_s")
     col_str = f"{col_avg:.2f}s" if isinstance(col_avg, (int, float)) else col_avg
     dis_str = f"{dis_avg:.2f}s" if isinstance(dis_avg, (int, float)) else dis_avg
     logger.info(f"  {'Avg iteration time':<35} {col_str:>15} {dis_str:>15}")
 
+    # 最终准确率
     col_acc = _get(colocate_results, "results", "final_accuracy")
     dis_acc = _get(disagg_results, "results", "final_accuracy")
     col_str = f"{col_acc:.2%}" if isinstance(col_acc, (int, float)) else col_acc
@@ -179,6 +182,7 @@ def print_comparison(colocate_results: dict, disagg_results: dict, logger):
     dis_str = f"{dis_overlap:.1%}" if isinstance(dis_overlap, (int, float)) else dis_str
     logger.info(f"  {'Avg overlap ratio':<35} {'N/A':>15} {dis_str:>15}")
 
+    # 峰值显存 (colocate only)
     col_mem = _get(colocate_results, "memory", "peak_mb")
     col_str = f"{col_mem:.0f}MB" if isinstance(col_mem, (int, float)) else col_mem
     logger.info(f"  {'Peak GPU memory':<35} {col_str:>15} {'N/A':>15}")

@@ -2,6 +2,7 @@
 # 对比实验全量运行脚本
 # 实验矩阵: 7并行策略 × 2 Attention后端 × 2训练模式 = 28组实验
 # 指标采集: 显存(peak/breakdown) / MFU / 吞吐 / 通信 / 训练loss
+#
 # 用法:
 #   bash scripts/run_duibi_all.sh          # 运行全部28组
 #   bash scripts/run_duibi_all.sh single   # 只运行单卡实验

@@ -83,6 +83,59 @@ def get_nested(config: dict, path: str, default=None):
     return value
 
 
+def _validate_parallel_config(config, logger):
+    """校验 3D 并行与 PP 相关配置，不法时抛出清晰错误。
+
+    - pp_size * tp_size * dp_size == world_size（world_size 从 WORLD_SIZE 环境变量读，非 torchrun 为 1）
+    - num_micro_batches >= pp_size
+    - global_batch % (num_micro_batches * dp_size) == 0
+    - pp_size > 1 → zero_stage <= 1（本期 PP 仅支持 ZeRO<=1）
+    """
+    pp = config.pp_size
+    tp = config.tp_size
+    dp = config.dp_size
+    nmb = config.num_micro_batches
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+
+    if pp * tp * dp != world_size:
+        raise ValueError(
+            f"并行度乘积与 world_size 不匹配：pp_size({pp}) * tp_size({tp}) * dp_size({dp}) "
+            f"= {pp * tp * dp} != WORLD_SIZE({world_size})。请用 torchrun --nproc_per_node={pp * tp * dp} 启动。"
+        )
+    if nmb < pp:
+        raise ValueError(
+            f"num_micro_batches({nmb}) 必须 >= pp_size({pp})（否则 1F1B 无法填满流水线）。"
+        )
+    global_batch = config.batch_size
+    if global_batch % (nmb * dp) != 0:
+        raise ValueError(
+            f"global_batch({global_batch}) 必须能被 num_micro_batches*dp_size = {nmb}*{dp} = {nmb * dp} 整除"
+            f"（否则无法均匀切分 per-DP micro-batch）。"
+        )
+    if pp > 1 and config.zero_stage > 1:
+        raise ValueError(
+            f"pp_size({pp}) > 1 本期仅支持 zero_stage <= 1，当前 zero_stage={config.zero_stage}。"
+            f"请将 training.zero_stage 设为 0 或 1。"
+        )
+    if pp > 1 and config.training_mode != "sft":
+        raise ValueError(
+            f"pp_size({pp}) > 1 本期仅支持 training_mode='sft'，当前 training_mode='{config.training_mode}'。"
+        )
+
+    if pp > 1:
+        bubble = (pp - 1) / nmb
+        logger.info(
+            "Pipeline Parallel config OK: pp=%d, tp=%d, dp=%d, world_size=%d, "
+            "num_micro_batches=%d, est_bubble=(pp-1)/nmb=%.3f",
+            pp, tp, dp, world_size, nmb, bubble,
+        )
+    else:
+        logger.info(
+            "Parallel config OK: pp=%d, tp=%d, dp=%d, world_size=%d, num_micro_batches=%d",
+            pp, tp, dp, world_size, nmb,
+        )
+
+
 async def main():
     args = parse_args()
     logger = setup_logger("colocate", log_file=args.log_file)
@@ -133,10 +186,12 @@ async def main():
         model_path=args.model or get_nested(cfg, "model.name_or_path", "Qwen/Qwen3-0.6B"),
         tp_size=args.tp_size if args.tp_size is not None else get_nested(cfg, "runtime.tp_size", 1),
         pp_size=get_nested(cfg, "distributed.pp_size", 1),
+        num_micro_batches=get_nested(cfg, "distributed.num_micro_batches", 1),
         dp_size=args.dp_size if args.dp_size is not None else get_nested(cfg, "runtime.dp_size", 1),
         max_seq_len=get_nested(cfg, "model.max_seq_len", 2048),
         use_flash_attn=get_nested(cfg, "model.use_flash_attn", False),
         attention_backend=get_nested(cfg, "model.attention_backend", "sdpa"),
+        use_gradient_checkpoint=get_nested(cfg, "model.use_gradient_checkpoint", False),
         training_mode=training_mode,
         output_dir=get_nested(cfg, "experiment.output_dir", "outputs"),
         checkpoint_save_dir=get_nested(cfg, "checkpoint.save_dir", "checkpoints"),
@@ -189,6 +244,10 @@ async def main():
 
     if args.config:
         logger.info(f"Loaded config: {args.config}")
+
+    # 并行配置校验（pp/tp/dp、num_micro_batches、global_batch、PP+ZeRO 限制）
+    _validate_parallel_config(config, logger)
+
     logger.info(f"Starting Colocate mode: model={config.model_path}, tp={config.tp_size}, dp={config.dp_size}, iters={config.total_iterations}")
     logger.info(f"  Training mode: {config.training_mode}")
     logger.info(f"  Inference backend: {config.inference_backend}")
@@ -198,6 +257,7 @@ async def main():
     logger.info(f"  Batch size: {config.batch_size}, Samples/prompt: {config.num_samples_per_prompt}")
     logger.info(f"  LoRA rank: {config.lora_rank}, LR: {config.learning_rate}")
     logger.info(f"  Checkpoint: save_enabled={config.checkpoint_save_enabled}, interval={config.checkpoint_save_interval}")
+    logger.info(f"  Gradient checkpointing: use_gradient_checkpoint={config.use_gradient_checkpoint}")
 
     orchestrator = ColocateOrchestrator(config)
     await orchestrator.initialize()

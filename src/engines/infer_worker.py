@@ -284,6 +284,7 @@ def _create_infer_worker_class():
     return InferWorker
 
 
+# 延迟创建，避免import时ray未初始化报错
 InferWorker = None
 
 

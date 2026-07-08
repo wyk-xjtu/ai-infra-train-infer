@@ -21,6 +21,7 @@ import sys
 import time
 from typing import Dict, List, Optional
 
+# 将项目 src 路径加入 sys.path
 _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(_project_root, "src"))
 
@@ -76,6 +77,7 @@ def generate_prompts_tokens(
             prompts_tokens.append(tokens)
         return prompts_tokens
     else:
+        # mock 模式: 随机生成 token ids（vocab_size=151936）
         import random
         random.seed(42)
         return [
@@ -138,6 +140,7 @@ def benchmark_single_mode(
         "enable_prefix_caching": False,
     }
 
+    # mock 模式不加载模型
     if mode == "mock":
         config_kwargs["num_blocks"] = 2048
         config_kwargs["block_size"] = 16
@@ -246,6 +249,7 @@ def benchmark_single_mode(
     total_tokens = sum(all_tokens_generated)
     throughput = total_tokens / total_time_sec if total_time_sec > 0 else 0.0
 
+    # 峰值显存
     peak_memory_gb = 0.0
     if use_cuda:
         peak_memory_bytes = torch.cuda.max_memory_allocated()
@@ -338,6 +342,7 @@ def benchmark_all_modes(
                 f"{res['peak_memory_gb']:<12.3f}"
             )
 
+    # Speedup 计算（以 eager 为 baseline）
     eager_result = next((r for r in valid_results if r["mode"] == "eager"), None)
     if eager_result:
         print("\n--- Speedup vs eager ---")

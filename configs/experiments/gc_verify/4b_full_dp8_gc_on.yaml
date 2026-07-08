@@ -1,0 +1,110 @@
+# Gradient Checkpointing 验证 - 开启组
+# 目标: 4B 全量 SFT + 大 seq_len 放大激活显存, 相对 GC 关闭组应显著降低峰值显存, loss 精确等价
+#
+# Usage:
+#   torchrun --nproc_per_node=8 scripts/run_colocate.py --config configs/experiments/gc_verify/4b_full_dp8_gc_on.yaml --inference-backend custom
+
+experiment:
+  name: "4b_full_dp8_gc_on"
+  stage: "sft"
+  seed: 42
+  output_dir: "outputs/gc_verify/gc_on"
+
+runtime:
+  device: "auto"
+  precision: "bf16"
+  tp_size: 1
+  dp_size: 8
+  inference_backend: "custom"
+  deterministic: false
+  enable_comm_overlap: false
+
+model:
+  name_or_path: "./models/Qwen3-4B"
+  max_seq_len: 2048
+  trust_remote_code: true
+  use_flash_attn: false
+  attention_backend: "standard"
+  use_gradient_checkpoint: true
+
+data:
+  dataset_name: "yahma/alpaca-cleaned"
+  dataset_config: null
+  split: "train"
+  max_samples: 1000
+  prompt_template: "qwen3_instruction"
+  prompt_field: "instruction"
+  input_field: "input"
+  response_field: "output"
+  answer_field: null
+
+training:
+  mode: "sft"
+  zero_stage: 1
+  total_iterations: 10
+  batch_size: 2
+  train_steps_per_iteration: 1
+  gradient_accumulation_steps: 1
+  learning_rate: 2.0e-5
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  lr_scheduler: "cosine"
+  warmup_steps: 2
+  min_lr_ratio: 0.1
+
+lora:
+  enabled: false
+  rank: 0
+  alpha: 0
+  dropout: 0.0
+  target_modules:
+    - "q_proj"
+    - "k_proj"
+    - "v_proj"
+    - "o_proj"
+    - "gate_proj"
+    - "up_proj"
+    - "down_proj"
+
+distributed:
+  zero_stage: 1
+
+inference_preview:
+  enabled: false
+  max_tokens: 1
+  temperature: 0.7
+  top_p: 0.95
+
+eval:
+  max_tokens: 1
+  num_prompts: 0
+
+checkpoint:
+  save_dir: "checkpoints/gc_verify/gc_on"
+  save_interval: 9999
+  save_enabled: false
+  resume_from: null
+
+profiling:
+  enabled: true
+  interval: 10
+  memory_breakdown: true
+  compute_mfu: true
+  track_communication: true
+  metrics:
+    - peak_memory_gb
+    - model_memory_gb
+    - optimizer_memory_gb
+    - gradient_memory_gb
+    - activation_memory_gb
+    - memory_utilization_pct
+    - mfu_pct
+    - step_time_ms
+    - tokens_per_sec
+    - samples_per_sec
+    - comm_time_ratio
+    - allreduce_latency_ms
+    - comm_volume_mb
+    - loss
+    - grad_norm
+    - learning_rate

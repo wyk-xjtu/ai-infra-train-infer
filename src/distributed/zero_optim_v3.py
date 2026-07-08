@@ -91,10 +91,9 @@ class ZeROStage3Optimizer:
         elif parallel_context and parallel_context.dp_size > 1:
             # DP模式：ZeRO 在 dp_group 上操作（梯度在 DP rank 间同步）
             self.group = parallel_context.dp_group
-        elif parallel_context:
-            # 纯TP模式（向后兼容）：ZeRO 在 tp_group 上操作
-            self.group = parallel_context.tp_group
         else:
+            # [X-2修复] dp_size<=1：ZeRO 退化为本地优化器（不分片）。
+            # 不再回退 tp_group，避免对 TP 切分参数做语义错误的 ReduceScatter/AllGather。
             self.group = None
 
         # 从通信组获取 world_size 和 rank
@@ -199,6 +198,15 @@ class ZeROStage3Optimizer:
         6. 重置 grad_count
         """
         # 收集所有梯度到临时 flat buffer
+        # [X-1修复] TP 组内先对 replicated 参数梯度 AllReduce(SUM)，
+        # 保证完整梯度 = Σ(各TP rank部分梯度)，再交由下游 DP ReduceScatter 做 DP 平均。
+        # TP 切分参数不带 _tp_replicated 标记，天然不受影响。
+        pc = self.parallel_context
+        if pc is not None and pc.tp_size > 1 and pc.tp_group is not None:
+            for p in self.params:
+                if p.grad is not None and getattr(p, "_tp_replicated", False):
+                    dist.all_reduce(p.grad, op=dist.ReduceOp.SUM, group=pc.tp_group)
+
         flat_grad = torch.zeros(
             self.padded_size, dtype=self._buffer_dtype, device=self._device
         )
@@ -390,6 +398,13 @@ class ZeROStage3Optimizer:
             total_norm: 全局梯度范数（正常值）
             -1.0: 检测到 NaN/Inf
         """
+        # [X-4修复] 若 backward 结束后仍有部分参数未触发 hook（部分参数无梯度），
+        # 强制 flush 一次 ReduceScatter，避免梯度滞留导致本步更新丢失。
+        if 0 < self._grad_count < len(self.params):
+            logger.warning("Partial grads ready (%d/%d), forcing reduce-scatter flush",
+                           self._grad_count, len(self.params))
+            self._reduce_scatter_grads()
+
         if torch.isnan(self._local_grad_acc).any() or torch.isinf(self._local_grad_acc).any():
             logger.warning("NaN/Inf detected in ZeRO-3 local gradients")
             return -1.0

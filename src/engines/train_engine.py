@@ -33,14 +33,33 @@ from ..utils.metrics import MetricsCollector
 logger = get_logger("engines.train")
 
 
+def _sft_pp_loss_fn(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    """PP 调度器专用 SFT 损失，与 TrainEngine._compute_sft_loss 对齐（next-token shift + ignore_index=-100）。
+
+    PipelineScheduler.forward_step 会将本函数返回值除以 num_micro_batches 后累加。
+    注：每个 micro-batch 取 CE 均值后再平均，当各 micro-batch 有效 token 数不同时
+    与“整批均值”存在微小差异，属已知近似（与业界梯度累加一致）。
+    """
+    shift_logits = logits[:, :-1, :].contiguous()
+    shift_labels = labels[:, 1:].contiguous()
+    return F.cross_entropy(
+        shift_logits.view(-1, shift_logits.size(-1)),
+        shift_labels.view(-1),
+        ignore_index=-100,
+    )
+
+
 @dataclass
 class TrainConfig:
     model_path: str
     tp_size: int = 1
     dp_size: int = 1
+    pp_size: int = 1                     # Pipeline Parallelism 度（>1 启用 1F1B 流水线）
+    num_micro_batches: int = 1          # PP micro-batch 数（要求 >= pp_size）
     max_seq_len: int = 2048
     use_flash_attn: bool = False
     attention_backend: str = "sdpa"  # "standard" / "sdpa" / "flash_attn"
+    use_gradient_checkpoint: bool = False  # 梯度检查点：激活重算换显存
     lora_rank: int = 16
     lora_alpha: float = 32.0
     lora_target_modules: List[str] = field(
@@ -62,6 +81,7 @@ class TrainConfig:
     zero_stage: int = 1                 # ZeRO 阶段: 1=优化器分片, 2=优化器+梯度分片, 3=全分片
     # 通信-计算 overlap
     enable_comm_overlap: bool = False   # 当 tp_size > 1 时启用通信与计算重叠
+    # 原硬编码魔数配置化
     min_prompt_len: int = 16            # 序列截断时保留的最少prompt token数
     min_advantage_scale: float = 0.01   # K=1退化时的minimum advantage
     # LR Scheduler
@@ -82,7 +102,15 @@ class TrainMetrics:
 
 
 class TrainEngine:
-    """集成Mini-Megatron的训练引擎，支持GRPO算法"""
+    """集成Mini-Megatron的训练引擎，支持GRPO算法
+
+    Pipeline Parallel (pp_size>1) 前置条件（本期 MVP）：
+    - 仅支持 SFT（sft_step -> _pp_batch_step -> PipelineScheduler）；GRPO 需 pp_size=1。
+    - 仅支持 zero_stage<=1（普通/ZeRO-1 优化器）；zero_stage>1 暂不支持。
+    - 要求 num_micro_batches >= pp_size（否则 1F1B 流水线无法填满）。
+    - pp_size=1 时行为与未启用 PP 完全一致。
+    上述约束在 initialize() 内 fail-fast 校验（即使绕过 run_colocate 直接使用本类）。
+    """
 
     def __init__(self, config: TrainConfig):
         self.config = config
@@ -97,6 +125,9 @@ class TrainEngine:
         self.metrics_collector: Optional[MetricsCollector] = None
         self.lr_scheduler = None
         self._old_log_probs_buffer: Optional[torch.Tensor] = None  # GRPO importance sampling buffer
+        # Pipeline Parallel（pp_size>1 时在 initialize 中创建；否则保持 None，走现状路径）
+        self.pp_context = None
+        self.pipeline_scheduler = None
 
     def initialize(self, parallel_context: Optional[ParallelContext] = None):
         """初始化模型、LoRA、优化器
@@ -114,10 +145,49 @@ class TrainEngine:
             self.parallel_ctx = ParallelContext.init_distributed(
                 tp_size=self.config.tp_size,
                 dp_size=self.config.dp_size,
+                pp_size=self.config.pp_size,
                 backend="nccl",
             )
 
+        # 本期 PP 仅支持 SFT + zero_stage<=1，且 num_micro_batches>=pp_size。
+        if self.parallel_ctx.pp_size > 1:
+            if self.config.zero_stage > 1:
+                raise ValueError(
+                    f"Pipeline Parallel (pp_size={self.parallel_ctx.pp_size}) 本期仅支持 "
+                    f"zero_stage<=1，当前 zero_stage={self.config.zero_stage}。"
+                )
+            if self.config.num_micro_batches < self.parallel_ctx.pp_size:
+                raise ValueError(
+                    f"Pipeline Parallel 要求 num_micro_batches>=pp_size，当前 "
+                    f"num_micro_batches={self.config.num_micro_batches} < "
+                    f"pp_size={self.parallel_ctx.pp_size}。"
+                )
+
+        # Pipeline Parallel 上下文与 1F1B 调度器（仅 pp_size>1 时创建）
+        # pp_size==1 时 pp_context/pipeline_scheduler 保持 None，训练路径与现状完全一致。
+        self.pp_context = None
+        self.pipeline_scheduler = None
+
         model_config = self._load_model_config(self.config.model_path)
+
+        # Pipeline Parallel: pp_size>1 时创建 stage 上下文 + 1F1B 调度器
+        if self.parallel_ctx.pp_size > 1:
+            from ..distributed.pipeline_parallel import PipelineParallelContext
+            from ..distributed.pipeline_scheduler import PipelineScheduler
+            self.pp_context = PipelineParallelContext(
+                self.parallel_ctx, num_layers=model_config["num_layers"]
+            )
+            self.pipeline_scheduler = PipelineScheduler(
+                self.pp_context,
+                num_micro_batches=self.config.num_micro_batches,
+                loss_fn=_sft_pp_loss_fn,
+            )
+            logger.info(
+                "Pipeline Parallel enabled: %r, num_micro_batches=%d, est_bubble=%.3f",
+                self.pp_context,
+                self.config.num_micro_batches,
+                (self.pp_context.pp_size - 1) / max(1, self.config.num_micro_batches),
+            )
 
         # 通信-计算 overlap: 仅在 tp_size > 1 且配置启用时创建 StreamManager
         stream_manager = None
@@ -143,9 +213,16 @@ class TrainEngine:
             tie_word_embeddings=model_config.get("tie_word_embeddings", False),
             use_flash_attn=self.config.use_flash_attn,
             attention_backend=self.config.attention_backend,
+            use_gradient_checkpoint=self.config.use_gradient_checkpoint,
             enable_comm_overlap=enable_overlap,
             stream_manager=stream_manager,
+            pp_context=self.pp_context,
         )
+        if self.config.use_gradient_checkpoint:
+            logger.info(
+                "Gradient checkpointing ENABLED (activation recompute) for %d layers",
+                model_config["num_layers"],
+            )
 
         # 加载HF checkpoint权重
         from ..distributed.tensor_parallel import load_from_hf_checkpoint
@@ -249,12 +326,10 @@ class TrainEngine:
                 logger.info("ref_model parameters also cast to %s", self.config.amp_dtype)
 
         # ZeRO作用域选择:
-        # - dp_size > 1: ZeRO 在 dp_group 上操作（梯度在 DP rank 间同步）
-        # - dp_size == 1 且 tp_size > 1: ZeRO 在 tp_group 上操作（向后兼容）
-        # - 都是 1: 使用普通 AdamW
+        #   纯 TP 场景不再经 ZeRO 省显存
+        # - 都是 1: 等价普通 AdamW
         trainable_params = [p for p in self.model.parameters() if p.requires_grad]
         if self.parallel_ctx.dp_size > 1 or self.parallel_ctx.tp_size > 1:
-            # 选择 ZeRO stage
             if self.config.zero_stage == 3:
                 self.optimizer = ZeROStage3Optimizer(
                     params=iter(trainable_params),
@@ -263,11 +338,11 @@ class TrainEngine:
                     lr=self.config.learning_rate,
                     weight_decay=self.config.weight_decay,
                 )
-                zero_group = "dp_group" if self.parallel_ctx.dp_size > 1 else "tp_group"
+                zero_group = "dp_group" if self.parallel_ctx.dp_size > 1 else "local(no-shard)"
                 logger.info(
                     "Optimizer initialized: Mini-ZeRO Stage-3 AdamW on %s (size=%s)",
                     zero_group,
-                    self.parallel_ctx.dp_size if self.parallel_ctx.dp_size > 1 else self.parallel_ctx.tp_size,
+                    self.parallel_ctx.dp_size if self.parallel_ctx.dp_size > 1 else 1,
                 )
             elif self.config.zero_stage == 2:
                 self.optimizer = ZeROStage2Optimizer(
@@ -277,11 +352,11 @@ class TrainEngine:
                     lr=self.config.learning_rate,
                     weight_decay=self.config.weight_decay,
                 )
-                zero_group = "dp_group" if self.parallel_ctx.dp_size > 1 else "tp_group"
+                zero_group = "dp_group" if self.parallel_ctx.dp_size > 1 else "local(no-shard)"
                 logger.info(
                     "Optimizer initialized: Mini-ZeRO Stage-2 AdamW on %s (size=%s)",
                     zero_group,
-                    self.parallel_ctx.dp_size if self.parallel_ctx.dp_size > 1 else self.parallel_ctx.tp_size,
+                    self.parallel_ctx.dp_size if self.parallel_ctx.dp_size > 1 else 1,
                 )
             else:
                 # ZeRO-1 (默认)
@@ -292,11 +367,11 @@ class TrainEngine:
                     lr=self.config.learning_rate,
                     weight_decay=self.config.weight_decay,
                 )
-                zero_group = "dp_group" if self.parallel_ctx.dp_size > 1 else "tp_group"
+                zero_group = "dp_group" if self.parallel_ctx.dp_size > 1 else "local(no-shard)"
                 logger.info(
                     "Optimizer initialized: Mini-ZeRO Stage-1 AdamW on %s (size=%s)",
                     zero_group,
-                    self.parallel_ctx.dp_size if self.parallel_ctx.dp_size > 1 else self.parallel_ctx.tp_size,
+                    self.parallel_ctx.dp_size if self.parallel_ctx.dp_size > 1 else 1,
                 )
         else:
             self.optimizer = torch.optim.AdamW(
@@ -320,6 +395,7 @@ class TrainEngine:
                 else self.optimizer
             )
 
+            # Warmup: linear from ~0 to base_lr
             warmup_scheduler = LinearLR(
                 base_optimizer,
                 start_factor=0.01,
@@ -328,14 +404,12 @@ class TrainEngine:
             )
 
             if self.config.lr_scheduler_type == "cosine":
-                # Cosine decay
                 decay_scheduler = CosineAnnealingLR(
                     base_optimizer,
                     T_max=max(total_steps - warmup_steps, 1),
                     eta_min=self.config.learning_rate * self.config.min_lr_ratio,
                 )
             else:
-                # Linear decay
                 decay_scheduler = LinearLR(
                     base_optimizer,
                     start_factor=1.0,
@@ -343,7 +417,6 @@ class TrainEngine:
                     total_iters=max(total_steps - warmup_steps, 1),
                 )
 
-            # 组合 warmup + decay
             self.lr_scheduler = SequentialLR(
                 base_optimizer,
                 schedulers=[warmup_scheduler, decay_scheduler],
@@ -355,7 +428,8 @@ class TrainEngine:
                 self.config.learning_rate * self.config.min_lr_ratio,
             )
 
-        # ZeRO optimizer already owns gradient synchronization; keep AMP in autocast-only mode.
+        # ZeROOptimizer的ReduceScatter已处理梯度同步，
+        # GradScaler会与ZeRO的梯度管理冲突。采用autocast-only模式（无GradScaler）。
         # torch.amp.autocast 在新版 PyTorch 中必须显式指定 device_type。
         if self.config.amp_dtype == "fp32":
             self._amp_enabled = False
@@ -385,7 +459,8 @@ class TrainEngine:
         3. 如果prompt+response超长，截断prompt尾部
         """
         max_seq_len = self.config.max_seq_len
-        # min_prompt_len 不能超过实际 prompt 长度，否则短 prompt 会被扩成无效切片。
+        # min_prompt_len不应超过实际prompt长度，
+        # 否则当prompt本身<16时逻辑异常（截断后的prompt比原始prompt还长）
         min_prompt_len = min(self.config.min_prompt_len, len(prompt))
 
         total = len(prompt) + len(response)
@@ -508,6 +583,10 @@ class TrainEngine:
         Returns:
             TrainMetrics: 训练指标
         """
+        # 本期 PP 仅实现 SFT 路径（GRPO 的 rollout/logprob 多次前向与 PP 调度耦合更复杂，留待后续）。
+        assert not (self.pp_context is not None and self.pp_context.pp_size > 1), (
+            "Pipeline Parallel (pp_size>1) 本期仅支持 SFT (sft_step)；GRPO 请使用 pp_size=1。"
+        )
         device = next(self.model.parameters()).device
         batch_size = len(prompts_tokens)
         num_samples = len(responses_group[0])  # K
@@ -601,7 +680,6 @@ class TrainEngine:
 
         self._old_log_probs_buffer = log_probs.detach().clone()
 
-        # 梯度累积
         scaled_loss = loss / self.config.gradient_accumulation_steps
 
         # autocast-only模式：无需scaler.scale()，直接backward
@@ -617,13 +695,11 @@ class TrainEngine:
         grad_norm = 0.0
         if self._accumulation_count >= self.config.gradient_accumulation_steps:
             # autocast-only模式：不再有GradScaler分支
-            # 梯度裁剪：ZeRO-2/3 使用专用接口（p.grad 已被清空）
             if isinstance(self.optimizer, (ZeROStage2Optimizer, ZeROStage3Optimizer)):
                 grad_norm = self.optimizer.clip_grad_norm(self.config.max_grad_norm)
             else:
                 grad_norm = self._clip_grad_norm()
             if grad_norm < 0:
-                # 梯度异常（NaN/Inf），跳过optimizer更新
                 logger.warning("Skipping optimizer step due to gradient anomaly")
                 self.optimizer.zero_grad()
                 self._accumulation_count = 0
@@ -697,52 +773,11 @@ class TrainEngine:
         input_ids_tensor = torch.tensor(padded_input_ids, dtype=torch.long, device=device)
         labels_tensor = torch.tensor(padded_labels, dtype=torch.long, device=device)
 
-        # ZeRO-3: forward 前 AllGather 完整参数
-        if isinstance(self.optimizer, ZeROStage3Optimizer):
-            self.optimizer.pre_forward()
-
-        if self._amp_enabled:
-            with autocast(device_type=device.type, dtype=self._amp_dtype):
-                loss = self._compute_sft_loss(input_ids_tensor, labels_tensor)
+        # 训练步分发：pp_size>1 走 1F1B 流水线，否则走单批（bit 级不变）路径
+        if self.pp_context is not None and self.pp_context.pp_size > 1:
+            loss_value, grad_norm = self._pp_batch_step(input_ids_tensor, labels_tensor)
         else:
-            loss = self._compute_sft_loss(input_ids_tensor, labels_tensor)
-
-        scaled_loss = loss / self.config.gradient_accumulation_steps
-        scaled_loss.backward()
-
-        # ZeRO-3: backward 后释放完整参数
-        if isinstance(self.optimizer, ZeROStage3Optimizer):
-            self.optimizer.post_backward()
-
-        self._accumulation_count += 1
-        grad_norm = 0.0
-        if self._accumulation_count >= self.config.gradient_accumulation_steps:
-            # 梯度裁剪：ZeRO-2/3 使用专用接口（p.grad 已被清空）
-            if isinstance(self.optimizer, (ZeROStage2Optimizer, ZeROStage3Optimizer)):
-                grad_norm = self.optimizer.clip_grad_norm(self.config.max_grad_norm)
-            else:
-                grad_norm = self._clip_grad_norm()
-            if grad_norm < 0:
-                # 梯度异常（NaN/Inf），跳过optimizer更新
-                logger.warning("Skipping optimizer step due to gradient anomaly")
-                self.optimizer.zero_grad()
-                self._accumulation_count = 0
-                # 不递增 step_count
-            else:
-                self.optimizer.step()
-                if self.lr_scheduler is not None:
-                    self.lr_scheduler.step()
-                self.optimizer.zero_grad()
-                self._accumulation_count = 0
-                self.step_count += 1  # 仅在真正更新权重时递增
-                # 显存水位监控
-                if self.step_count % 10 == 0 and torch.cuda.is_available():
-                    peak_mem = torch.cuda.max_memory_allocated() / 1e9
-                    logger.info("[Step %d] peak_memory=%.2fGB", self.step_count, peak_mem)
-                    if self.metrics_collector is not None:
-                        self.metrics_collector.record("peak_memory_gb", peak_mem)
-
-        loss_value = loss.item()
+            loss_value, grad_norm = self._single_batch_step(input_ids_tensor, labels_tensor)
 
         # 获取当前动态 lr
         current_lr = self.lr_scheduler.get_last_lr()[0] if self.lr_scheduler else self.config.learning_rate
@@ -1017,6 +1052,143 @@ class TrainEngine:
 
         return seq_log_probs
 
+    def _single_batch_step(self, input_ids_tensor: torch.Tensor, labels_tensor: torch.Tensor):
+        """单批 SFT 训练步（pp_size==1 路径，与重构前逻辑 bit 级一致）。
+
+        forward -> loss -> (缩放)backward -> 梯度累加 -> 满步时 clip/step/zero_grad。
+        返回 (loss_value, grad_norm)。
+        """
+        device = next(self.model.parameters()).device
+
+        # ZeRO-3: forward 前 AllGather 完整参数
+        if isinstance(self.optimizer, ZeROStage3Optimizer):
+            self.optimizer.pre_forward()
+
+        if self._amp_enabled:
+            with autocast(device_type=device.type, dtype=self._amp_dtype):
+                loss = self._compute_sft_loss(input_ids_tensor, labels_tensor)
+        else:
+            loss = self._compute_sft_loss(input_ids_tensor, labels_tensor)
+
+        scaled_loss = loss / self.config.gradient_accumulation_steps
+        scaled_loss.backward()
+
+        # ZeRO-3: backward 后释放完整参数
+        if isinstance(self.optimizer, ZeROStage3Optimizer):
+            self.optimizer.post_backward()
+
+        self._accumulation_count += 1
+        grad_norm = 0.0
+        if self._accumulation_count >= self.config.gradient_accumulation_steps:
+            if isinstance(self.optimizer, (ZeROStage2Optimizer, ZeROStage3Optimizer)):
+                grad_norm = self.optimizer.clip_grad_norm(self.config.max_grad_norm)
+            else:
+                grad_norm = self._clip_grad_norm()
+            if grad_norm < 0:
+                logger.warning("Skipping optimizer step due to gradient anomaly")
+                self.optimizer.zero_grad()
+                self._accumulation_count = 0
+                # 不递增 step_count
+            else:
+                self.optimizer.step()
+                if self.lr_scheduler is not None:
+                    self.lr_scheduler.step()
+                self.optimizer.zero_grad()
+                self._accumulation_count = 0
+                self.step_count += 1  # 仅在真正更新权重时递增
+                # 显存水位监控
+                if self.step_count % 10 == 0 and torch.cuda.is_available():
+                    peak_mem = torch.cuda.max_memory_allocated() / 1e9
+                    logger.info("[Step %d] peak_memory=%.2fGB", self.step_count, peak_mem)
+                    if self.metrics_collector is not None:
+                        self.metrics_collector.record("peak_memory_gb", peak_mem)
+
+        return loss.item(), grad_norm
+
+    def _pp_batch_step(self, input_ids_tensor: torch.Tensor, labels_tensor: torch.Tensor):
+        """Pipeline Parallel SFT 训练步（pp_size>1）。
+
+        1) 将当前 batch 沿 batch 维切成 num_micro_batches 份，构造 (input_ids, labels) 迭代器；
+        2) 运行 1F1B，梯度累加到本 stage 参数 p.grad（调度器内部已按 1/num_micro 缩放）；
+        3) 统一 clip_grad_norm + optimizer.step + zero_grad（每个 rank 更新自己 stage 的参数）；
+        4) loss 日志：在 pp_group 内从末 stage 广播真实 loss，使各 rank 的 TrainMetrics 一致。
+
+        注：PP 下一次调度即完成一个完整 batch（含 num_micro_batches 个微批）的前后向，
+        因此直接 step（num_micro_batches 即梯度累加），不叠加外层 gradient_accumulation_steps。
+        本期 PP 仅支持 zero_stage<=1（普通/ZeRO-1 优化器，使用 _clip_grad_norm）。
+        """
+        num_micro = self.config.num_micro_batches
+        micro_inputs = torch.chunk(input_ids_tensor, num_micro, dim=0)
+        micro_labels = torch.chunk(labels_tensor, num_micro, dim=0)
+        assert len(micro_inputs) == num_micro and len(micro_labels) == num_micro, (
+            f"batch_size={input_ids_tensor.shape[0]} 无法均分为 {num_micro} 份 micro-batch"
+            f"（得 {len(micro_inputs)} 份）；请保证 per-DP batch 能被 num_micro_batches 整除"
+        )
+        # torch.chunk 不整除时最后一块更短且上面 len 断言恒真，无法发现非均分。
+        # 显式校验各 micro-batch 大小一致，保证 1F1B 数学等价（各微批 loss 等权平均）前提成立。
+        batch_sizes = {mb.shape[0] for mb in micro_inputs}
+        if len(batch_sizes) != 1:
+            raise ValueError(
+                f"per-DP batch_size={input_ids_tensor.shape[0]} 无法被 num_micro_batches"
+                f"={num_micro} 均分（得到不等大小的 micro-batch: {sorted(batch_sizes)}）；"
+                f"请保证 per-DP batch 能被 num_micro_batches 整除。"
+            )
+        micro_batches = list(zip(micro_inputs, micro_labels))
+
+        device = next(self.model.parameters()).device
+        # 1F1B：warmup/steady/cooldown，梯度累加到本 stage 参数（调度器内部 loss.backward）
+        if self._amp_enabled:
+            with autocast(device_type=device.type, dtype=self._amp_dtype):
+                loss_tensor = self.pipeline_scheduler.run_1f1b_schedule(
+                    self.model, iter(micro_batches)
+                )
+        else:
+            loss_tensor = self.pipeline_scheduler.run_1f1b_schedule(
+                self.model, iter(micro_batches)
+            )
+
+        # 统一 clip + step + zero_grad（本 rank 更新自己 stage 的参数）
+        grad_norm = self._clip_grad_norm()
+        if grad_norm < 0:
+            logger.warning("Skipping optimizer step due to gradient anomaly (PP)")
+            self.optimizer.zero_grad()
+        else:
+            self.optimizer.step()
+            if self.lr_scheduler is not None:
+                self.lr_scheduler.step()
+            self.optimizer.zero_grad()
+            self.step_count += 1
+            if self.step_count % 10 == 0 and torch.cuda.is_available():
+                peak_mem = torch.cuda.max_memory_allocated() / 1e9
+                logger.info("[Step %d][PP] peak_memory=%.2fGB", self.step_count, peak_mem)
+                if self.metrics_collector is not None:
+                    self.metrics_collector.record("peak_memory_gb", peak_mem)
+
+        # loss 广播：仅末 stage 有真实 loss，在 pp_group 内从末 stage 广播至全部 stage
+        loss_value = self._broadcast_pp_loss(loss_tensor)
+        return loss_value, grad_norm
+
+    def _broadcast_pp_loss(self, loss_tensor: Optional[torch.Tensor]) -> float:
+        """在 pp_group 内从末 stage 广播标量 loss，使各 stage 的 TrainMetrics.loss 一致。
+
+        末 stage 持真实累加 loss（非 None）；其余 stage loss_tensor 为 None，先填 0 再接收广播。
+        dist.broadcast 的 src 为全局 rank（即使指定 group），取 pp_group 成员列表末位（末 stage）。
+        """
+        import torch.distributed as dist
+
+        pp = self.pp_context
+        device = next(self.model.parameters()).device
+        if loss_tensor is not None:
+            buf = loss_tensor.detach().float().reshape(()).to(device)
+        else:
+            buf = torch.zeros((), dtype=torch.float32, device=device)
+
+        if pp is not None and pp.pp_group is not None and pp.pp_size > 1:
+            group_ranks = dist.get_process_group_ranks(pp.pp_group)
+            src_global = group_ranks[-1]  # 成员按 pp_rank 递增，末位即末 stage
+            dist.broadcast(buf, src=src_global, group=pp.pp_group)
+        return buf.item()
+
     def _compute_sft_loss(self, input_ids: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
         """计算 SFT 交叉熵损失。"""
         logits = self.model(input_ids)
@@ -1130,17 +1302,18 @@ class TrainEngine:
         total_norm_sq = torch.tensor(total_norm_sq, device=next(iter(trainable_params)).device)
 
         # 多卡时AllReduce梯度范数平方和
-        # 根因：纯DP场景(tp=1,dp>1)时tp_group只有自己，不是全局norm。
-        # 需要根据并行模式选择正确的通信组进行梯度范数聚合。
+        # 3D 全局范数：对存在的每个并行组各自独立 AllReduce 平方范数和。
+        # 旧实现用 norm_group = dp_group if dp>1 else tp_group 做"二选一"，当 dp>1 且 tp>1 时
+        # 会漏掉 TP 维度导致全局范数低估、裁剪偏弱。改为逐组累加：
         if self.parallel_ctx is not None and self.parallel_ctx.world_size > 1:
             import torch.distributed as dist
-            # 选择正确的 norm 通信组
-            if self.parallel_ctx.dp_size > 1:
-                norm_group = self.parallel_ctx.dp_group
-            else:
-                norm_group = self.parallel_ctx.tp_group
             t0 = time.perf_counter()
-            dist.all_reduce(total_norm_sq, op=dist.ReduceOp.SUM, group=norm_group)
+            if self.parallel_ctx.dp_size > 1 and self.parallel_ctx.dp_group is not None:
+                dist.all_reduce(total_norm_sq, op=dist.ReduceOp.SUM, group=self.parallel_ctx.dp_group)
+            if self.parallel_ctx.tp_size > 1 and self.parallel_ctx.tp_group is not None:
+                dist.all_reduce(total_norm_sq, op=dist.ReduceOp.SUM, group=self.parallel_ctx.tp_group)
+            if self.parallel_ctx.pp_size > 1 and self.parallel_ctx.pp_group is not None:
+                dist.all_reduce(total_norm_sq, op=dist.ReduceOp.SUM, group=self.parallel_ctx.pp_group)
             comm_time_ms = (time.perf_counter() - t0) * 1000
             if self.metrics_collector is not None:
                 self.metrics_collector.record("comm_time_ms", comm_time_ms)
@@ -1176,15 +1349,22 @@ class TrainEngine:
             合并后的 state_dict，tensor 位于指定 device 上
         """
         self.model.eval()
-        # merge_lora_weights 在 GPU 上完成（模型参数已在 GPU）
-        merged_state = merge_lora_weights(self.model)
-
-        if device == "cpu":
-            # 传统路径: 将权重移到CPU以释放GPU显存
-            result = {k: v.cpu() for k, v in merged_state.items()}
+        # [Z3-1同类修复] ZeRO-3 下参数可能为空壳，需先 AllGather 恢复完整参数再合并 LoRA
+        if isinstance(self.optimizer, ZeROStage3Optimizer):
+            ctx = self.optimizer.eval_mode()
         else:
-            # 优化路径: 保留在 GPU 上，避免 GPU→CPU 拷贝
-            result = merged_state
+            from contextlib import nullcontext
+            ctx = nullcontext()
+        with ctx:
+            # merge_lora_weights 在 GPU 上完成（模型参数已在 GPU）
+            merged_state = merge_lora_weights(self.model)
+
+            if device == "cpu":
+                # 传统路径: 将权重移到CPU以释放GPU显存
+                result = {k: v.cpu() for k, v in merged_state.items()}
+            else:
+                # 优化路径: 保留在 GPU 上，避免 GPU→CPU 拷贝
+                result = merged_state
 
         self.model.train()
         return result
@@ -1193,6 +1373,15 @@ class TrainEngine:
         """保存训练检查点（仅LoRA参数 + optimizer state）"""
         import os
         os.makedirs(path, exist_ok=True)
+
+        # [Z3-1修复] ZeRO-3 参数若已释放为空壳，先 AllGather 恢复完整参数再导出 LoRA，
+        # 否则 get_lora_state_dict 会得到 size-0 空 tensor。
+        _zero3_restored = False
+        if isinstance(self.optimizer, ZeROStage3Optimizer) and any(
+            p.numel() == 0 for p in self.optimizer.params
+        ):
+            self.optimizer.pre_forward()
+            _zero3_restored = True
 
         # 保存LoRA参数
         lora_state = get_lora_state_dict(self.model)
@@ -1214,6 +1403,10 @@ class TrainEngine:
         # 保存scaler状态
         if self.scaler is not None:
             torch.save(self.scaler.state_dict(), os.path.join(path, "scaler_state.pt"))
+
+        # [Z3-1修复] 恢复释放状态，保持训练循环显存语义不变
+        if _zero3_restored:
+            self.optimizer.post_backward()
 
         logger.info("[Rank %d] Checkpoint saved to %s", self.parallel_ctx.rank, path)
 

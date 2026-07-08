@@ -1,9 +1,11 @@
 #!/bin/bash
 # 启动vLLM推理服务（Colocate模式用）
+#
 # 用法:
 #   bash scripts/start_vllm_server.sh                    # 默认0.6B单卡
 #   bash scripts/start_vllm_server.sh Qwen/Qwen3-4B 2   # 4B模型TP=2
 #   bash scripts/start_vllm_server.sh Qwen/Qwen3-0.6B 1 8000 0.85
+#
 # 参数:
 #   $1 - 模型名称 (默认: Qwen/Qwen3-0.6B)
 #   $2 - TP大小 (默认: 1)
