@@ -42,7 +42,7 @@ def split_layers_to_stages(num_layers: int, pp_size: int) -> List[Tuple[int, int
     assert pp_size >= 1, f"pp_size must be >= 1, got {pp_size}"
     assert num_layers >= 0, f"num_layers must be >= 0, got {num_layers}"
 
-    # num_layers < pp_size 时部分 stage 将分到 0 层（空 stage），通常非预期。
+    # [FIX-D] num_layers < pp_size 时部分 stage 将分到 0 层（空 stage），通常非预期。
     if num_layers < pp_size:
         logger.warning(
             "split_layers_to_stages: num_layers=%d < pp_size=%d，部分 stage 将为 0 层（空 stage），"
@@ -88,7 +88,9 @@ class PipelineParallelContext:
             num_layers, self.pp_size
         )
 
+    # ------------------------------------------------------------------
     # PP 拓扑信息（转发自 ParallelContext）
+    # ------------------------------------------------------------------
 
     @property
     def pp_rank(self) -> int:
@@ -115,7 +117,9 @@ class PipelineParallelContext:
         """后一个 stage 的全局 rank；最后一个 stage 或无 PP 时为 None"""
         return self._pc.next_rank
 
+    # ------------------------------------------------------------------
     # Stage 判定与层范围
+    # ------------------------------------------------------------------
 
     @property
     def is_first_stage(self) -> bool:

@@ -1,50 +1,115 @@
 # AI Infra Train Infer
 
-面向 AI Infra 岗位的训练、推理、RL 一体化原型框架。项目重点是手写并验证训练系统中的关键机制：Tensor Parallel、Pipeline Parallel、ZeRO、FlashAttention、LoRA/full SFT、GRPO 训练闭环、KV Cache、Prefix Cache、Continuous Batching、权重同步和训推编排。
+面向大模型训练、推理与强化学习场景的基础设施项目。项目覆盖模型训练、分布式并行、自研推理引擎、训推编排、权重同步、性能分析和实验产物管理，可用于验证单机多卡环境下的系统设计与优化方案。
 
-当前训练侧已经覆盖单卡、DP、TP、PP、ZeRO-1/2/3、FlashAttention、LoRA/full SFT 和 32B LoRA/Full TP 实验；推理和 RL 侧保留轻量可运行实现，用于展示训推一体系统的模块边界和数据流，后续将深入开发。
+项目包含三条核心链路：
 
-## 核心能力
+```text
+训练链路（SFT）
+Dataset -> Prompt 构造与 Tokenize -> Forward / SFT Loss -> Backward
+        -> Gradient Sync / Optimizer Step -> Checkpoint / Evaluation
 
-| 方向 | 实现内容 |
-| --- | --- |
-| Training | Full SFT、LoRA SFT、GRPO loss、gradient accumulation、AMP/bf16、checkpoint、eval、metrics artifact |
-| Parallelism | Megatron-style TP、DP、PP、TP/DP/PP 3D process group、1F1B pipeline schedule |
-| Pipeline Parallel | stage-aware layer split、P2P activation/gradient send-recv、micro-batch warmup/steady/cooldown |
-| Optimizer Sharding | Mini-ZeRO Stage 1/2/3：optimizer state sharding、gradient sharding、parameter sharding 原型 |
-| Attention | standard attention、PyTorch SDPA、FlashAttention 后端切换 |
-| Inference | eager、mock、KV cache path、Paged KV Cache、Continuous Batching、Prefix Cache、CUDA Graph runner 原型 |
-| RL | GSM8K rule reward、rollout -> reward -> GRPO train 的闭环接口 |
-| Orchestration | Colocate 训推共置、Disaggregated 训推分离、weight sync、artifact/log/summary 输出 |
-| Profiling | MFU、tokens/s、step time、显存分解、通信耗时、schedule timeline |
+RL 链路（GRPO）
+Dataset -> Rollout（每个 Prompt 生成 K 条 Response）-> Rule Reward
+        -> Advantage 计算 -> C3PO++ 切分与打包（可选）-> Policy Log-prob
+        -> IcePop 过滤（可选）-> GRPO Loss / Backward / Optimizer Step
+        -> Weight Sync -> 下一轮 Rollout
+
+推理链路
+Request -> Tokenize -> Continuous Batching -> Prefix / Radix Cache 匹配
+        -> Prefill -> Paged KV Cache -> Decode -> Sampling -> Output
+```
+
+## 功能概览
+
+### 分布式训练
+
+- 支持 Full SFT 和 LoRA SFT。
+- Data Parallel：按 DP rank 切分数据并同步梯度。
+- Tensor Parallel：实现 Column Parallel Linear、Row Parallel Linear、并行 Attention、并行 MLP 和 Transformer Layer。
+- 支持 GQA/MQA、RoPE、HF checkpoint 到 TP 模型的权重映射与分片加载。
+- Pipeline Parallel：支持按层切分 stage、P2P activation/gradient 通信和 1F1B 调度。
+- 1F1B 调度包含 warmup、steady 和 cooldown 阶段，并支持 micro-batch。
+- 支持 TP、DP、PP 三维进程组及组合配置。
+- ZeRO Stage 1：optimizer state sharding。
+- ZeRO Stage 2：optimizer state 与 gradient sharding、reduce-scatter gradient。
+- ZeRO Stage 3：parameter、gradient 与 optimizer state sharding，并提供训练和评估阶段的参数聚合。
+- 支持 LoRA 与 Tensor Parallel 组合，覆盖 column-parallel 和 row-parallel 线性层。
+- 支持 standard attention、PyTorch SDPA 和 FlashAttention 后端切换。
+- 支持 FP32、FP16、BF16、AMP、gradient accumulation、gradient clipping 和 gradient checkpointing。
+- 支持 cosine、linear、constant 学习率调度及 warmup，以及 checkpoint 保存、恢复和 SFT loss 评估。
+- 支持独立 CUDA Stream 管理及通信、计算、权重传输之间的同步与重叠。
+
+### 强化学习
+
+- 实现基于 GRPO 的强化学习闭环：rollout、reward、advantage、policy update 和 weight sync。
+- 每个 prompt 支持生成 K 条 response，并按组内奖励计算标准化 relative advantage。
+- 使用当前策略、行为策略和参考模型的 token log-prob，计算 clipped policy loss 与 KL penalty。
+- 提供 GSM8K 规则奖励，支持答案抽取、格式检查、正确性判定和批量奖励计算。
+- 支持 IcePop 训推偏差过滤，根据 rollout policy 与 training policy 的序列级 log-prob 差异调整样本 advantage，并记录过滤比例等诊断指标。
+- 支持 C3PO++ response chunking 与 FFD packing；同一 response 的 chunk 共享 advantage，多个 sub-batch 完成后统一更新参数。
+- 记录 reward、iteration accuracy、cumulative accuracy、policy loss、KL divergence 和 response 长度等指标。
+
+### 推理引擎
+
+- 支持 `eager`、`kv_cache` 和 `mock` 三种运行模式。
+- 实现 Paged KV Cache、物理 block pool、sequence block table 和 KV Cache 生命周期管理。
+- 支持 FP16 与 FP8 KV Cache 存储。
+- 实现 Continuous Batching，支持 token budget、请求状态管理、chunked prefill 和请求抢占。
+- 支持普通 Prefix Cache、K-sample prompt 前缀复用和基于 Radix Tree 的前缀缓存。
+- 实现 Paged Attention 与 Partitioned Paged Attention；长上下文 decode 可按 partition 计算后合并结果。
+- 支持异步 Prefill/Decode 调度，使用独立 CUDA Stream 组织执行。
+- 支持 CUDA Graph capture/replay，并在权重更新后刷新相关缓存状态。
+- 支持 draft model speculative decoding，包含候选 token 生成、目标模型校验和接受率统计。
+- 支持 temperature、top-p、batch generation、JSONL 批量输入输出和交互式推理。
+- 提供独立推理入口和 eager、KV Cache、mock 多模式 benchmark。
+
+### 训推编排
+
+- Colocate 模式：训练与推理共享设备资源，在同一闭环中完成 rollout、reward、training 和 weight update。
+- Disaggregated 模式：训练 worker 与推理 worker 分离部署，支持流水执行和权重版本管理。
+- 推理后端支持项目内置推理引擎与 vLLM 服务接入。
+- 支持同步与异步训推流水线，可配置队列长度、最大权重陈旧度和异步任务管理。
+- 支持训练、推理、奖励计算、休眠、权重同步和唤醒等阶段的状态管理与耗时统计。
+- 支持 config snapshot、metrics JSONL、run summary、固定 prompt 对比、loss curve 和 rank-aware artifact 输出。
+
+### 权重同步
+
+- 支持 CUDA IPC 权重传输、分块推送、checksum 校验、版本更新和失败回滚。
+- 支持 NCCL broadcast/receive 权重同步。
+- 支持通过 Ray Object Store 发布和获取权重版本。
+- 提供统一的 Weight Transfer Manager，用于选择 IPC、NCCL 或 Ray 传输路径。
+- 支持 SwiftSync LoRA 增量同步：计算相邻版本 LoRA delta，仅传输发生变化的参数。
+- SwiftSync 提供双缓冲 LoRA 状态，在 shadow buffer 应用增量后切换 active buffer。
+- 支持异步 delta/full sync、定期全量校准、版本号与传输统计。
 
 ## 项目结构
 
 ```text
 ai-infra-train-infer/
-├── configs/                  # SFT/RL/inference/multi-GPU/benchmark/PP 配置
-├── docs/                     # 设计说明和代码审查记录
-├── scripts/                  # 训练、推理 benchmark、显存 profiling、实验矩阵脚本
+├── configs/
+│   ├── training/              # SFT、RL、Colocate、Disaggregated、PP 配置
+│   ├── inference/             # 独立推理配置
+│   ├── benchmark/             # 功能对比与消融实验配置
+│   └── experiments/           # DP、TP、ZeRO、FlashAttention 等实验矩阵
+├── docs/                      # 已整理的实验结果
+├── scripts/                   # 训练、推理、benchmark、数据准备与 profiling 入口
 ├── src/
-│   ├── data/                 # GSM8K / SFT 数据加载与 DP shard
-│   ├── distributed/          # TP、PP、ZeRO、LoRA、通信原语、stream overlap
-│   ├── engines/              # TrainEngine / InferWorker
-│   ├── inference/            # KV Cache、scheduler、prefix cache、model runner
-│   ├── orchestrator/         # Colocate / Disaggregated 编排
-│   ├── profiling/            # MFU、通信、timeline profiling
-│   ├── reward/               # GSM8K rule reward
-│   ├── transfer/             # IPC / NCCL 权重同步原型
-│   └── utils/                # logger、metrics、artifact、memory profiler
-└── tests/                    # TP、PP、ZeRO、训推编排、权重同步测试
+│   ├── data/                  # 数据加载、prompt 构造与 DP shard
+│   ├── distributed/           # TP、PP、ZeRO、LoRA、通信与 CUDA Stream
+│   ├── engines/               # 训练引擎、推理 worker、IcePop、C3PO++
+│   ├── inference/             # KV Cache、调度器、Attention、推测解码
+│   ├── orchestrator/          # Colocate 与 Disaggregated 编排
+│   ├── profiling/             # MFU、通信和 timeline profiling
+│   ├── reward/                # GSM8K 规则奖励
+│   ├── transfer/              # IPC、NCCL、Ray、SwiftSync 权重同步
+│   └── utils/                 # 日志、指标、评估和实验产物管理
+└── tests/                     # 分布式、推理、编排与权重同步测试
 ```
-
-
-
-当前限制：PP 主要支持 SFT，GRPO 仍要求 `pp_size=1`；PP 与 ZeRO 组合当前限制为 `zero_stage = 1`。相关测试包括 `tests/test_pipeline_parallel.py` 和 `tests/test_pipeline_scheduler.py`。
 
 ## 训练结果摘要
 
-完整结果表格见 [docs/training_results_summary.md](docs/training_results_summary.md)。下面是适合放在项目首页的核心指标。小模型实验用于证明正确性、显存和吞吐趋势；MFU 只报告 32B 实验。
+完整实验表格见 [docs/training_results_summary.md](docs/training_results_summary.md)。小模型实验用于验证正确性、显存和吞吐趋势，MFU 数据来自 32B 实验。
 
 ### 正确性
 
@@ -55,7 +120,7 @@ ai-infra-train-infer/
 | LoRA single / DP / TP | single、DP2/4/8、TP2/4/8 loss 均稳定下降 |
 | 32B LoRA + TP8 | loss 稳定下降，单 rank current allocated 约 `12.78GB` |
 
-### 显存和吞吐
+### 显存与吞吐
 
 | 指标 | 结果 |
 | --- | --- |
@@ -74,42 +139,64 @@ ai-infra-train-infer/
 | 32B Full TP8 standard | `33.82%` | `62.07%` | `54.71` | `62.62` |
 | 32B Full TP8 flash | `33.40%` | `64.60%` | `54.71` | `61.67` |
 
-## 运行方式
+## 快速开始
 
-训练实验采用 config-first 的方式管理：模型路径、并行策略、数据集、训练步数、LoRA、ZeRO、checkpoint 和 profiling 都写在 YAML 里。`scripts/run_colocate.py` 支持命令行参数覆盖 YAML 字段，但推荐只在临时调试时使用 override。
+### 安装依赖
 
-安装依赖：
+Windows 环境：
 
 ```bash
 pip install -r requirements-windows.txt
 ```
 
-Linux/CUDA + vLLM/Ray 环境使用完整依赖：
+Linux/CUDA 环境：
 
 ```bash
 pip install -r requirements.txt
 ```
 
-模型建议放在项目根目录的 `models/` 下：
+### 准备模型与数据
+
+模型默认放在项目根目录的 `models/` 下：
 
 ```bash
 modelscope download --model Qwen/Qwen3-0.6B --local_dir ./models/Qwen3-0.6B
 ```
 
+离线准备 Hugging Face 数据集：
+
+```bash
+python scripts/prepare_data.py \
+  --dataset yahma/alpaca-cleaned \
+  --split train \
+  --output ./data/alpaca-cleaned
+```
+
+### 运行训练
+
 单卡 SFT：
 
 ```bash
-python scripts/run_colocate.py --config configs/sft.yaml
+python scripts/run_colocate.py \
+  --config configs/training/sft.yaml \
+  --dp-size 1
 ```
 
-PP smoke test：
+8 卡 GRPO（TP=2，DP=4）：
+
+```bash
+torchrun --nproc_per_node=8 scripts/run_colocate.py \
+  --config configs/training/rl.yaml
+```
+
+2 卡 Pipeline Parallel smoke test：
 
 ```bash
 torchrun --nproc_per_node=2 scripts/run_colocate.py \
   --config configs/training/pp_smoke_pp2.yaml
 ```
 
-PP + TP / PP + DP / PP + ZeRO-1 组合配置：
+PP + TP、PP + DP、PP + ZeRO-1 组合配置：
 
 ```text
 configs/training/pp_combo_pptp.yaml
@@ -117,26 +204,50 @@ configs/training/pp_combo_ppdp.yaml
 configs/training/pp_combo_ppzero.yaml
 ```
 
-多卡对比实验：
+8 卡对比实验示例：
 
 ```bash
 torchrun --nproc_per_node=8 scripts/run_colocate.py \
   --config configs/experiments/duibi/lora_flash_tp8.yaml
 ```
 
+### 运行推理
+
+单条 prompt：
+
+```bash
+python scripts/run_inference.py \
+  --model ./models/Qwen3-0.6B \
+  --mode eager \
+  --prompt "Solve: 18 + 24 =" \
+  --max-tokens 128
+```
+
+使用独立推理配置：
+
+```bash
+python scripts/run_inference.py \
+  --model ./models/Qwen3-0.6B \
+  --config configs/inference/standalone.yaml
+```
+
 推理 benchmark：
 
 ```bash
-python scripts/benchmark_inference.py --mode mock --num-prompts 32 --batch-size 8
+python scripts/benchmark_inference.py \
+  --model_path ./models/Qwen3-0.6B \
+  --mode all \
+  --num_prompts 32 \
+  --batch_size 8
 ```
 
-## 设计取舍
+### 性能分析
 
-- TP/PP/ZeRO/LoRA/调度器均为简化版自研实现，优先体现系统机制和可读性。
-- PP 当前定位是 SFT 训练侧的 1F1B MVP，已覆盖 process group、stage split、P2P 和 scheduler；GRPO + PP 暂未接入。
-- 训练结果主要证明正确性、显存效率、吞吐扩展和大模型可运行性；生产级容错、弹性训练和大规模集群调度暂未实现。
-- 推理侧实现覆盖 KV Cache、Prefix Cache、Continuous Batching、CUDA Graph 等核心概念，目前仅支持简单推理，尚未进行深入修改。
-- `outputs/`、`models/`、checkpoint 和缓存目录不纳入仓库。
+```bash
+python scripts/profile_memory.py \
+  --config configs/experiments/duibi/lora_flash_single.yaml
+```
+
 
 ## 测试
 
@@ -144,10 +255,28 @@ python scripts/benchmark_inference.py --mode mock --num-prompts 32 --batch-size 
 pytest tests
 ```
 
-重点测试覆盖：
+测试覆盖：
 
-- Tensor Parallel layer 与参考实现对齐
-- Pipeline process group、P2P 通信、1F1B schedule
-- ZeRO optimizer shard 行为
-- Colocate 训推状态机
-- IPC weight update protocol mock
+- Tensor Parallel 层与参考实现的数值对齐。
+- Pipeline process group、P2P 通信和 1F1B schedule。
+- ZeRO optimizer shard 行为与 3D parallel gradient norm。
+- Colocate 训练闭环和异步训推状态管理。
+- Paged KV Cache、独立推理入口和推理调度。
+- IPC weight update、SwiftSync delta 与双缓冲切换。
+- IcePop 过滤逻辑、C3PO++ 切分打包及二者的组合流程。
+
+## 产物管理
+
+运行产生的 `outputs/`、`models/`、checkpoint 和缓存目录通过 `.gitignore` 管理。仓库保留源代码、配置、测试以及已经整理并确认的实验结果。
+
+## 更新记录
+
+### [2026.7.20] 新增
+
+- 新增 IcePop 训推 log-prob 偏差过滤，支持阈值控制、最大过滤比例和诊断指标。
+- 新增 C3PO++ response chunking 与 FFD packing，支持跨 chunk advantage 继承和延迟 optimizer update。
+- 新增 SwiftSync LoRA delta 权重同步，支持双缓冲、异步传输、版本统计和周期性 full sync。
+- 新增异步训推流水线，支持 rollout、training、weight sync 任务编排及 staleness/queue 配置。
+- 新增 FP8 KV Cache、Partitioned Paged Attention、Radix Attention Cache 和 speculative decoding。
+- 新增独立推理入口、批量 JSONL/交互式推理，以及针对新增模块的 benchmark 与消融配置。
+- 新增 iteration/cumulative accuracy、rank-aware artifact 和新增功能的单元测试、组合测试。

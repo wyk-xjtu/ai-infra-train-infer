@@ -74,7 +74,7 @@ class MemoryProfiler:
         device = torch.device(f"cuda:{self.device_id}")
         allocated = torch.cuda.memory_allocated(device) / (1024 * 1024)
         reserved = torch.cuda.memory_reserved(device) / (1024 * 1024)
-        peak = torch.cuda.max_memory_allocated(device) / (1024 * 1024)
+        peak = torch.cuda.max_memory_reserved(device) / (1024 * 1024)
 
         snap = MemorySnapshot(
             timestamp=time.time() - self._start_time,
@@ -158,7 +158,9 @@ class MemoryProfiler:
         return snap_b.allocated_mb - snap_a.allocated_mb
 
 
+# ============================================================
 # MemoryBreakdown: 显存按用途分类分析
+# ============================================================
 
 
 class MemoryBreakdown:
@@ -212,12 +214,14 @@ class MemoryBreakdown:
             "fragmentation_mb": 0.0,
         }
 
+        # 模型权重
         if self.model is not None:
             model_bytes = sum(
                 p.nelement() * p.element_size() for p in self.model.parameters()
             )
             result["model_weights_mb"] = model_bytes / (1024 * 1024)
 
+            # 梯度（如果存在）
             grad_bytes = sum(
                 p.grad.nelement() * p.grad.element_size()
                 for p in self.model.parameters()
@@ -225,6 +229,7 @@ class MemoryBreakdown:
             )
             result["gradients_mb"] = grad_bytes / (1024 * 1024)
 
+        # 优化器状态
         if self.optimizer is not None:
             optim_bytes = 0
             for group in self.optimizer.param_groups:
@@ -275,10 +280,12 @@ class MemoryBreakdown:
         Returns:
             各类别的显存估算（MB）和总计
         """
+        # === 模型权重 ===
         # TP: 每卡约存 1/tp_size（近似，实际embedding和norm不切分）
         weight_bytes = model_params * dtype_bytes / tp_size
         weight_mb = weight_bytes / (1024 * 1024)
 
+        # === 可训练参数（LoRA vs 全参数）===
         if lora_rank > 0:
             # LoRA参数量 ≈ 2 * rank * hidden_size * num_linear_layers
             # 每层约4个linear (q,k,v,o) + 3个MLP linear
@@ -287,6 +294,7 @@ class MemoryBreakdown:
         else:
             trainable_params = model_params / tp_size
 
+        # === 优化器状态 (Adam: m和v各一份FP32) ===
         optim_bytes_per_param = 8  # FP32 m + FP32 v = 4 + 4 = 8 bytes
         optim_bytes = trainable_params * optim_bytes_per_param
 
@@ -295,11 +303,14 @@ class MemoryBreakdown:
             optim_bytes /= tp_size  # 简化：用tp_size近似world_size
         optim_mb = optim_bytes / (1024 * 1024)
 
+        # === 梯度 ===
+        # 梯度与可训练参数同精度（通常FP16或BF16）
         grad_bytes = trainable_params * dtype_bytes
         if zero_stage >= 2:
             grad_bytes /= tp_size
         grad_mb = grad_bytes / (1024 * 1024)
 
+        # === 激活值 ===
         # 简化估算：每层激活 ≈ B * S * H * dtype_bytes * activation_factor
         # activation_factor ≈ 10-14（考虑attention scores, QKV, 中间结果等）
         activation_factor = 12  # 经验值
@@ -308,14 +319,18 @@ class MemoryBreakdown:
         )
         activation_mb = activation_bytes / (1024 * 1024)
 
+        # === KV Cache (推理时) ===
+        # KV Cache per layer = 2 * B * S * num_kv_heads * head_dim * dtype_bytes
         kv_cache_bytes = (
             2 * num_layers * batch_size * seq_len * num_kv_heads * head_dim * dtype_bytes
         )
         kv_cache_mb = kv_cache_bytes / (1024 * 1024)
 
+        # === 碎片预留 (约10-15%额外开销) ===
         subtotal = weight_mb + optim_mb + grad_mb + activation_mb
         fragmentation_mb = subtotal * 0.12  # 约12%碎片
 
+        # === 总计 ===
         total_training_mb = weight_mb + optim_mb + grad_mb + activation_mb + fragmentation_mb
         total_inference_mb = weight_mb + kv_cache_mb + fragmentation_mb * 0.5
 
@@ -398,6 +413,7 @@ class MemoryBreakdown:
         if infer_mb > 0:
             lines.append(f"│  推理总计: {infer_mb/1024:.1f} GB" + " " * 21 + "│")
 
+        # 可训练参数信息
         trainable_ratio = estimate_result.get("trainable_ratio", 0)
         if trainable_ratio > 0 and trainable_ratio < 1:
             lines.append(f"│  可训练比例: {trainable_ratio:.4%} (LoRA)" + " " * 10 + "│")
@@ -406,7 +422,9 @@ class MemoryBreakdown:
         return "\n".join(lines)
 
 
+# ============================================================
 # MemoryReport: 完整显存分析报告生成器
+# ============================================================
 
 
 class MemoryReport:
@@ -462,6 +480,7 @@ class MemoryReport:
         torch.cuda.synchronize(device)
         mem_before_forward = torch.cuda.memory_allocated(device)
 
+        # 执行 forward（通过 train_step_fn 的部分执行或直接 model forward）
         with torch.no_grad():
             _ = self.model(input_ids)
 
@@ -508,6 +527,7 @@ class MemoryReport:
         report["dynamic_memory"] = self._get_dynamic_memory()
         report["framework_overhead"] = self._get_framework_overhead(device)
 
+        # 清理 hooks
         self._remove_hooks()
 
         return report
@@ -617,6 +637,7 @@ class MemoryReport:
     def _make_memory_hook(self, layer_name):
         """创建记录显存增量的 hook"""
         def hook(module, input, output):
+            # 记录输出 tensor 的大小
             if isinstance(output, torch.Tensor):
                 self._layer_memory[layer_name] = {
                     "output_mb": output.numel() * output.element_size() / 1e6,

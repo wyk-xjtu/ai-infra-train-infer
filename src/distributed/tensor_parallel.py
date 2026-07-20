@@ -56,6 +56,11 @@ def _divide(numerator: int, denominator: int) -> int:
     return numerator // denominator
 
 
+# ============================================================
+# RMSNorm (不做TP切分，每个rank保留完整参数)
+# ============================================================
+
+
 class RMSNorm(nn.Module):
     """Root Mean Square Layer Normalization (Qwen3 使用)
 
@@ -71,11 +76,17 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [batch, seq, hidden]
         input_dtype = x.dtype
         x = x.float()
         variance = x.pow(2).mean(-1, keepdim=True)
         x = x * torch.rsqrt(variance + self.eps)
         return (self.weight * x).to(input_dtype)
+
+
+# ============================================================
+# ColumnParallelLinear
+# ============================================================
 
 
 class ColumnParallelLinear(nn.Module):
@@ -108,14 +119,17 @@ class ColumnParallelLinear(nn.Module):
         self.tp_rank = parallel_context.tp_rank
         self.gather_output = gather_output
 
+        # 每个 rank 只持有 out_features/tp_size 行的权重
         self.out_features_per_rank = _divide(out_features, self.tp_size)
         self.in_features = in_features
         self.out_features = out_features
 
+        # 权重: [out_features/tp_size, in_features]
         self.weight = nn.Parameter(
             torch.empty(self.out_features_per_rank, in_features)
         )
         if bias:
+            # bias 也按 output_dim 切分
             self.bias = nn.Parameter(torch.empty(self.out_features_per_rank))
         else:
             self.register_parameter("bias", None)
@@ -138,14 +152,22 @@ class ColumnParallelLinear(nn.Module):
         Returns:
             output: [batch, seq, out_features/tp_size] (或 gather 后 [batch, seq, out_features])
         """
+        # 进入并行区域：前向 Identity, 反向 AllReduce(grad_x)
         x = copy_to_parallel_region(x, self.parallel_context.tp_group)
 
+        # 本地计算：Y_local = X @ W_local^T + b_local
         output = F.linear(x, self.weight, self.bias)
 
+        # 可选：AllGather 输出（一般不需要，留给后续 RowParallel）
         if self.gather_output:
             output = gather_from_parallel_region(output, self.parallel_context.tp_group)
 
         return output
+
+
+# ============================================================
+# RowParallelLinear
+# ============================================================
 
 
 class RowParallelLinear(nn.Module):
@@ -178,14 +200,17 @@ class RowParallelLinear(nn.Module):
         self.tp_rank = parallel_context.tp_rank
         self.input_is_parallel = input_is_parallel
 
+        # 每个 rank 只持有 in_features/tp_size 列的权重
         self.in_features_per_rank = _divide(in_features, self.tp_size)
         self.in_features = in_features
         self.out_features = out_features
 
+        # 权重: [out_features, in_features/tp_size]
         self.weight = nn.Parameter(
             torch.empty(out_features, self.in_features_per_rank)
         )
         if bias:
+            # bias 不切分（AllReduce 后只加一次）
             self.bias = nn.Parameter(torch.empty(out_features))
         else:
             self.register_parameter("bias", None)
@@ -207,14 +232,22 @@ class RowParallelLinear(nn.Module):
         Returns:
             output: [batch, seq, out_features] — AllReduce 聚合后的完整输出
         """
+        # 本地计算：y_local = x_local @ W_local^T
         output = F.linear(x, self.weight)
 
+        # 离开并行区域：前向 AllReduce(output), 反向 Identity(grad)
         output = reduce_from_parallel_region(output, self.parallel_context.tp_group)
 
+        # bias 在 AllReduce 之后加（避免重复加 tp_size 次）
         if self.bias is not None:
             output = output + self.bias
 
         return output
+
+
+# ============================================================
+# ParallelMLP (SwiGLU for Qwen3)
+# ============================================================
 
 
 class ParallelMLP(nn.Module):
@@ -266,7 +299,9 @@ class ParallelMLP(nn.Module):
         return self.down_proj(gate * up)
 
 
+# ============================================================
 # ParallelAttention (GQA/MHA)
+# ============================================================
 
 
 class ParallelAttention(nn.Module):
@@ -427,6 +462,7 @@ class ParallelAttention(nn.Module):
             k = k_flat.view(batch_size, seq_len, self.num_kv_heads, self.head_dim)
 
         if self.use_flash_attn:
+            # === Flash Attention 路径 ===
             # flash_attn_func 期望输入 shape: [batch, seq_len, num_heads, head_dim]
             # 当前 q/k/v 已经是 [batch, seq, num_heads, head_dim]，无需 transpose
 
@@ -455,6 +491,7 @@ class ParallelAttention(nn.Module):
                 batch_size, seq_len, self.num_heads * self.head_dim
             )
         else:
+            # === 非 Flash Attention 路径 ===
             # Transpose: [batch, num_heads, seq, head_dim]
             q = q.transpose(1, 2)
             k = k.transpose(1, 2)
@@ -506,7 +543,9 @@ class ParallelAttention(nn.Module):
         return output
 
 
+# ============================================================
 # ParallelTransformerLayer
+# ============================================================
 
 
 class ParallelTransformerLayer(nn.Module):
@@ -632,6 +671,9 @@ class ParallelTransformerLayer(nn.Module):
         """
         from .comm import all_reduce_async
 
+        # ============================================================
+        # Step 0: 完成上一层遗留的MLP AllReduce + residual add
+        # ============================================================
         if self._pending_mlp_handle is not None:
             # 等待上一层MLP AllReduce完成
             self._pending_mlp_handle.wait()
@@ -647,12 +689,18 @@ class ParallelTransformerLayer(nn.Module):
             self._pending_mlp_output = None
             self._pending_mlp_bias = None
 
+        # ============================================================
+        # Step 1: Attention（o_proj使用同步AllReduce，保持简单）
+        # ============================================================
         residual = x
         x = self.input_layernorm(x)
         # self_attn内部o_proj调用RowParallelLinear.forward() → 同步AllReduce
         x = self.self_attn(x, positions, attention_mask)
         x = residual + x
 
+        # ============================================================
+        # Step 2: MLP with async AllReduce（不立即wait）
+        # ============================================================
         residual = x
 
         # Post-attention LayerNorm
@@ -684,7 +732,9 @@ class ParallelTransformerLayer(nn.Module):
         return residual
 
 
+# ============================================================
 # ParallelTransformerModel (完整模型)
+# ============================================================
 
 
 class ParallelTransformerModel(nn.Module):
@@ -720,7 +770,9 @@ class ParallelTransformerModel(nn.Module):
     ):
         super().__init__()
 
+        # ============================================================
         # Pipeline Parallel: stage 感知
+        # ============================================================
         # pp_context 为 None 或 pp_size==1 时，构建完整的
         # embed→layers→norm→lm_head，行为与非 PP 版本完全一致（向后兼容）。
         # pp_size>1 时，仅构建本 stage 的组件：
@@ -892,7 +944,9 @@ class ParallelTransformerModel(nn.Module):
         return hidden_states
 
 
+# ============================================================
 # HuggingFace 权重加载工具
+# ============================================================
 
 
 def load_from_hf_checkpoint(

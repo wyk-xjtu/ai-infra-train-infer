@@ -1,0 +1,44 @@
+# Inference backend config.
+# custom is for local validation; vllm is for Linux CUDA rental GPU runs.
+
+experiment:
+  name: "qwen3_0_6b_inference"
+  stage: "inference"
+
+model:
+  name_or_path: "./models/Qwen3-0.6B"
+  max_model_len: 4096
+  trust_remote_code: true
+
+backend:
+  default: "custom"
+
+custom:
+  enabled: true
+  max_tokens: 32
+  temperature: 0.7
+  top_p: 0.95
+  use_kv_cache: false
+  enable_prefix_caching: true
+  enable_cuda_graph: false
+  num_blocks: 1024
+  block_size: 16
+  max_num_batched_tokens: 2048
+  max_num_sequences: 256
+
+vllm:
+  enabled: false
+  host: "127.0.0.1"
+  port: 8000
+  tensor_parallel_size: 1
+  gpu_memory_utilization: 0.85
+  dtype: "auto"
+  sleep_mode:
+    enabled: true
+    level: 1
+
+sampling:
+  max_tokens: 512
+  temperature: 0.7
+  top_p: 0.95
+  num_samples: 1

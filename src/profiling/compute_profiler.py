@@ -126,6 +126,7 @@ class ComputeProfiler:
         """
         B, S, H, I, L, V = batch_size, seq_len, hidden_size, intermediate_size, num_layers, vocab_size
 
+        # === Attention FLOPs (per layer) ===
         # QKV projections: 3 个 [B*S, H] x [H, H] 矩阵乘
         qkv_flops = 3 * 2 * B * S * H * H
         # Attention scores: [B, heads, S, head_dim] x [B, heads, head_dim, S]
@@ -137,6 +138,7 @@ class ComputeProfiler:
 
         attention_flops_per_layer = qkv_flops + attn_score_flops + attn_v_flops + out_proj_flops
 
+        # === MLP FLOPs (per layer, SwiGLU) ===
         # gate_proj: [B*S, H] x [H, I]
         gate_flops = 2 * B * S * H * I
         # up_proj: [B*S, H] x [H, I]
@@ -146,6 +148,7 @@ class ComputeProfiler:
 
         mlp_flops_per_layer = gate_flops + up_flops + down_flops
 
+        # === 总FLOPs ===
         per_layer_flops = attention_flops_per_layer + mlp_flops_per_layer
         all_layers_flops = per_layer_flops * L
 

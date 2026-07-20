@@ -2,8 +2,8 @@
 """独立显存分析工具 — 与训练解耦
 
 用法:
-    python scripts/profile_memory.py --config configs/sft.yaml
-    python scripts/profile_memory.py --config configs/sft.yaml --output report.json
+    python scripts/profile_memory.py --config configs/training/sft.yaml
+    python scripts/profile_memory.py --config configs/training/sft.yaml --output report.json
 
 功能:
     加载模型 + LoRA，执行一步 forward/backward profiling，
@@ -27,6 +27,7 @@ def main():
     parser.add_argument("--skip-backward", action="store_true", help="Skip backward pass profiling")
     args = parser.parse_args()
 
+    # 1. 读取配置
     with open(args.config, 'r') as f:
         config = yaml.safe_load(f)
 
@@ -55,6 +56,7 @@ def main():
     print(f"  Device: {device}")
     print(f"{'='*60}")
 
+    # 2. 加载模型
     print("\n[1/5] Loading model...")
     from src.distributed.parallel_context import ParallelContext
     from src.distributed.tensor_parallel import ParallelTransformerModel, load_from_hf_checkpoint
@@ -88,6 +90,7 @@ def main():
     load_from_hf_checkpoint(model, model_path, parallel_ctx)
     print(f"  Model loaded: {sum(p.numel() for p in model.parameters())/1e9:.2f}B params")
 
+    # 3. 注入 LoRA（在 CPU 上完成，避免设备不匹配）
     print("[2/5] Applying LoRA...")
     from src.distributed.lora import apply_lora
 
@@ -103,6 +106,7 @@ def main():
     total = sum(p.numel() for p in model.parameters())
     print(f"  LoRA applied: trainable={trainable/1e6:.1f}M / total={total/1e9:.2f}B ({trainable/total*100:.2f}%)")
 
+    # 4. 精度转换（在 CPU 上完成，节省 GPU 显存峰值）
     if precision != "fp32":
         print(f"[3/5] Casting frozen params to {precision}...")
         cast_dtype = torch.bfloat16 if precision == "bf16" else torch.float16
@@ -118,10 +122,12 @@ def main():
     # 将完整模型移到 GPU
     model = model.to(device)
 
+    # 5. 创建 optimizer（用于 profiling optimizer states）
     print("[4/5] Creating optimizer...")
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(trainable_params, lr=2e-5)
 
+    # 6. 运行 profiling
     print("[5/5] Running memory profiling...")
     from src.utils.memory_profiler import MemoryReport
 
@@ -165,6 +171,7 @@ def main():
     wrapped_model = AmpModelWrapper(model, amp_dtype)
     reporter = MemoryReport(wrapped_model, optimizer, report_config)
 
+    # 构造 dummy input
     dummy_input = torch.randint(0, 1000, (batch_size, max_seq_len), device=device)
     dummy_labels = torch.randint(0, 1000, (batch_size, max_seq_len), device=device)
     dummy_labels[:, :max_seq_len // 2] = -100  # 模拟 prompt mask
@@ -174,6 +181,7 @@ def main():
     else:
         report = reporter.profile_step(dummy_input, dummy_labels, train_step_fn=None)
 
+    # 7. 输出报告
     output_path = args.output or "outputs/memory_report.json"
     os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else ".", exist_ok=True)
 

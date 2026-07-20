@@ -1,0 +1,11 @@
+model:
+  name: "Qwen/Qwen3-4B"
+  fallback: "Qwen/Qwen3-0.6B"  # 本地开发用小模型
+  max_seq_len: 4096
+  dtype: "float16"
+
+lora:
+  rank: 16
+  alpha: 32
+  target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+  dropout: 0.0

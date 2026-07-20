@@ -2,8 +2,10 @@
 Disaggregated模式运行脚本
 
 用法:
+    # 需要4卡环境
     python scripts/run_disaggregated.py --model Qwen/Qwen3-4B --train-tp 2 --infer-tp 2
 
+    # 本地单卡模拟（顺序模式，用于调试）
     python scripts/run_disaggregated.py --model Qwen/Qwen3-0.6B --train-tp 1 --infer-tp 1 --no-overlap
 """
 import argparse

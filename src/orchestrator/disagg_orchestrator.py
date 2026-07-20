@@ -133,6 +133,7 @@ class DisaggOrchestrator:
         if not ray.is_initialized():
             ray.init(ignore_reinit_error=True)
 
+        # 1. 创建PlacementGroup
         bundles = [
             {"GPU": len(self.config.train_gpus)},  # 训练用GPU
             {"GPU": len(self.config.infer_gpus)},  # 推理用GPU
@@ -144,6 +145,7 @@ class DisaggOrchestrator:
         await asyncio.wrap_future(self._placement_group.ready())
         logger.info(f"PlacementGroup created: train_gpus={self.config.train_gpus}, infer_gpus={self.config.infer_gpus}")
 
+        # 2. 启动Training Worker
         TrainWorkerCls = get_train_worker_class()
         train_config = TrainConfig(
             model_path=self.config.model_path,
@@ -164,6 +166,7 @@ class DisaggOrchestrator:
         await asyncio.wrap_future(self._train_worker.initialize.remote())
         logger.info("TrainWorker initialized")
 
+        # 3. 启动Inference Worker
         InferWorkerCls = get_infer_worker_class()
         self._infer_worker = InferWorkerCls.options(
             placement_group=self._placement_group,
@@ -178,13 +181,16 @@ class DisaggOrchestrator:
         await asyncio.wrap_future(self._infer_worker.initialize.remote())
         logger.info("InferWorker initialized")
 
+        # 4. 初始化权重传输
         self._weight_manager = WeightTransferManager(
             backend=self.config.weight_sync_backend,
         )
         logger.info(f"WeightTransferManager initialized (backend={self.config.weight_sync_backend})")
 
+        # 5. 奖励函数
         self._reward_fn = GSM8KRewardFunction()
 
+        # 6. 数据管道
         self._data_pipeline = GSM8KDataPipeline(
             tokenizer_name=self.config.model_path,
             max_samples=self.config.max_data_samples,

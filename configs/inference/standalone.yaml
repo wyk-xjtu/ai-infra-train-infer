@@ -1,0 +1,25 @@
+# 推理引擎独立运行配置
+# 用法: python scripts/run_inference.py --config configs/inference/standalone.yaml
+
+model:
+  path: "./models/Qwen3-0.6B"
+
+inference:
+  mode: "eager"           # eager | kv_cache | mock
+  max_tokens: 256
+  temperature: 0.7
+  top_p: 0.95
+  batch_size: 1
+  num_samples: 1
+
+kv_cache:
+  num_blocks: 512
+  block_size: 16
+  enable_prefix_caching: false
+  enable_prefix_reuse: true
+  enable_cuda_graph: false
+
+advanced:
+  enable_async_scheduling: false
+  enable_partitioned_attention: false
+  use_radix_cache: false

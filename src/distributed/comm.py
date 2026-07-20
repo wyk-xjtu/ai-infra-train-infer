@@ -27,6 +27,11 @@ from torch.distributed import ProcessGroup, ReduceOp
 logger = logging.getLogger(__name__)
 
 
+# ============================================================
+# 基础通信原语
+# ============================================================
+
+
 def all_reduce(
     tensor: torch.Tensor,
     group: Optional[ProcessGroup],
@@ -115,6 +120,11 @@ def broadcast(
     return tensor
 
 
+# ============================================================
+# Autograd Functions (Megatron 风格的前向/反向通信配对)
+# ============================================================
+
+
 class _CopyToParallelRegion(torch.autograd.Function):
     """前向: Identity (输入直接传递给各 rank)
     反向: AllReduce (梯度需要聚合，因为各 rank 对同一输入计算了不同的列切片)
@@ -187,6 +197,11 @@ class _GatherFromParallelRegion(torch.autograd.Function):
         return chunks[rank].contiguous(), None
 
 
+# ============================================================
+# 便捷函数：用于模型前向中直接调用
+# ============================================================
+
+
 def copy_to_parallel_region(
     tensor: torch.Tensor, group: Optional[ProcessGroup]
 ) -> torch.Tensor:
@@ -206,6 +221,11 @@ def gather_from_parallel_region(
 ) -> torch.Tensor:
     """将输出从并行区域 AllGather（前向 Gather，反向 Split）"""
     return _GatherFromParallelRegion.apply(tensor, group)
+
+
+# ============================================================
+# 异步通信：通信-计算 Overlap 的核心
+# ============================================================
 
 
 class AsyncAllReduce:
@@ -365,6 +385,9 @@ def all_reduce_async(
     return async_op.start(tensor)
 
 
+# ============================================================
+# Pipeline Parallel P2P 通信原语
+# ============================================================
 #
 # 设计要点:
 # - 统一使用 torch.distributed.batch_isend_irecv([P2POp...]) 后 wait()，
@@ -374,6 +397,7 @@ def all_reduce_async(
 #   收发操作打包后由后端统一调度，避免顺序依赖导致的死锁。
 # - peer（prev_rank / next_rank）为全局 rank（ParallelContext 提供的
 #   global_rank ∓ tp_size），与 torch 点对点接口的 rank 语义一致。
+# - pp_group is None（无 PP / 单卡）时：send 系列为 no-op，recv 系列抛错
 #   （无法在无通信组时凭空生成远端数据）。
 
 

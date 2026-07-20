@@ -23,23 +23,30 @@ from .scheduler import (
     ContinuousBatchingScheduler,
 )
 from .prefix_cache import PrefixCache, CachedBlock
+from .radix_cache import RadixAttentionCache, RadixNode
 from .cuda_graph import CUDAGraphRunner
 from .context import InferenceContext, set_context, get_context, reset_context
-from .attention import PagedAttention, store_kv_cache, HAS_FLASH_ATTN
+from .attention import PagedAttention, PartitionedPagedAttention, store_kv_cache, HAS_FLASH_ATTN
 from .model_runner import ModelRunner, ModelRunnerConfig
 from .engine import InferenceEngine, InferenceConfig
 
 __all__ = [
+    # KV Cache
     "Block",
     "BlockPool",
     "BlockTable",
     "KVCacheManager",
+    # Scheduler
     "Request",
     "RequestState",
     "SchedulerOutput",
     "ContinuousBatchingScheduler",
+    # Prefix Cache
     "PrefixCache",
     "CachedBlock",
+    # Radix Cache (P2)
+    "RadixAttentionCache",
+    "RadixNode",
     # CUDA Graph
     "CUDAGraphRunner",
     # Context
@@ -49,6 +56,7 @@ __all__ = [
     "reset_context",
     # Attention
     "PagedAttention",
+    "PartitionedPagedAttention",
     "store_kv_cache",
     "HAS_FLASH_ATTN",
     # Model Runner

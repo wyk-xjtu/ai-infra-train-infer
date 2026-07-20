@@ -1,5 +1,5 @@
 """
-测试 TrainEngine._clip_grad_norm 的 3D 全局梯度范数归约正确性。
+测试 [FIX-A] TrainEngine._clip_grad_norm 的 3D 全局梯度范数归约正确性。
 
 背景:
     旧实现用 `norm_group = dp_group if dp>1 else tp_group` 做"二选一"归约，
@@ -14,7 +14,9 @@
       若仍是旧的"二选一"实现，引擎值只会覆盖 2 个 rank（部分和），与 4 rank 参考值不符。
 
 运行方式:
+    # tp2 x dp2（4 进程，CPU/gloo，无需 GPU）
     torchrun --nproc_per_node=4 tests/test_grad_norm_3d.py
+    # pp2 x tp2 x dp2（8 进程）
     torchrun --nproc_per_node=8 tests/test_grad_norm_3d.py
 """
 import sys
@@ -58,7 +60,9 @@ def _build_model_with_known_grads(ctx: ParallelContext) -> nn.Module:
     )
     for p in model.parameters():
         p.requires_grad_(True)
+        # 用 rank 相关的确定性梯度（非零、各 rank 不同）
         g = torch.full_like(p.data, fill_value=float(ctx.rank + 1) * 0.1)
+        # 叠加一点结构，避免所有元素完全相同
         g = g + torch.randn_like(p.data) * 0.01
         p.grad = g
     return model
@@ -80,12 +84,15 @@ def test_3d_grad_norm(ctx: ParallelContext):
     """核心断言：引擎全局范数 == 全部 rank 参考范数（证明 dp+tp[+pp] 均被计入）。"""
     model = _build_model_with_known_grads(ctx)
 
+    # 参考值需在 clip 之前用未改动的 grad 计算，先克隆一份 grad 快照
     ref_model_grads = [p.grad.clone() for p in model.parameters()]
     ref_norm = _reference_global_norm(model)
 
+    # 恢复 grad（_reference_global_norm 未改 grad，这里仅保险）
     for p, g in zip(model.parameters(), ref_model_grads):
         p.grad = g.clone()
 
+    # max_grad_norm 设为极大值 => clip_coef>1 => 不裁剪，返回值即全局范数
     engine = _FakeEngine(model, ctx, max_grad_norm=1e30)
     engine_norm = TrainEngine._clip_grad_norm(engine)
 
@@ -126,10 +133,12 @@ def _resolve_layout(world_size: int):
         return dict(tp_size=2, dp_size=2, pp_size=2)
     if world_size == 2:
         return dict(tp_size=2, dp_size=1, pp_size=1)
+    # 兜底：全部作为 TP
     return dict(tp_size=world_size, dp_size=1, pp_size=1)
 
 
 if __name__ == "__main__":
+    # 用 gloo（CPU）后端，便于无 GPU 环境跑 4/8 进程
     dist.init_process_group(backend="gloo")
     world_size = dist.get_world_size()
     layout = _resolve_layout(world_size)

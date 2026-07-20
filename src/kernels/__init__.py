@@ -5,6 +5,9 @@
 实际生产环境使用对应的开源库（如 flash-attn）。
 """
 
-from .flash_attention_triton import flash_attention_triton
+try:
+    from .flash_attention_triton import flash_attention_triton
+except ImportError:
+    flash_attention_triton = None
 
 __all__ = ["flash_attention_triton"]

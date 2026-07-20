@@ -51,13 +51,16 @@ logger = logging.getLogger(__name__)
 from .kv_cache import KVCacheManager, BlockPool
 from .scheduler import ContinuousBatchingScheduler, Request, SchedulerOutput, RequestState
 from .prefix_cache import PrefixCache
+from .radix_cache import RadixAttentionCache
 from .cuda_graph import CUDAGraphRunner
 from .model_runner import ModelRunner, ModelRunnerConfig
+from .speculative import SpeculativeConfig, SpeculativeDecoder
 
 
 @dataclass
 class InferenceConfig:
     """推理引擎配置"""
+    # 模型架构参数
     num_layers: int = 32
     num_heads: int = 32          # Query head 数
     num_kv_heads: int = 8       # GQA/MQA 的 KV head 数
@@ -65,9 +68,12 @@ class InferenceConfig:
     hidden_size: int = 4096
     vocab_size: int = 151936    # Qwen3 词表大小
 
+    # KV Cache 配置
     num_blocks: int = 1024      # 总物理 block 数
     block_size: int = 16        # 每个 block 存储的 token 数
+    kv_cache_dtype: str = "fp16"  # KV Cache 存储精度: "fp16"(默认) 或 "fp8"(显存减半)
 
+    # 调度器配置
     max_num_batched_tokens: int = 2048
     max_num_sequences: int = 256
     max_prefill_tokens: int = 1024
@@ -75,24 +81,55 @@ class InferenceConfig:
     chunk_size: int = 512
 
     # 优化开关
-    # Prefix Cache默认关闭。
+    # [P1-3根因修复] Prefix Cache默认关闭。
     # GSM8K等数据集prompt各不相同，命中率极低，hash查找开销大于收益。
     # 仅在对话/system_prompt复用度高的场景手动启用。
     enable_prefix_caching: bool = False
-    enable_cuda_graph: bool = True
+    enable_cuda_graph: bool = False
     max_cached_blocks: int = 512
 
+    # [P1优化] K-sample Prefix 复用
+    # 同一 batch 内多个相同 prompt（K-sample）场景，
+    # 第一个 prompt prefill 后注册 KV cache，后续相同 prompt 复用。
+    enable_prefix_reuse: bool = True
+
+    # [P1优化] 异步 Prefill-Decode 流调度
+    # 使用独立 CUDA Stream 实现 prefill 和 decode 的流水线并行
+    enable_async_scheduling: bool = False
+
+    # [P2优化] 分区 PagedAttention v2
+    # 长序列 decode 时将 KV 分区并行计算，每个 partition 独立计算局部 attention
+    # 然后使用 log-sum-exp 技巧精确合并。context_len <= partition_size 时走标准路径。
+    enable_partitioned_attention: bool = False
+    attention_partition_size: int = 512
+
+    # [P2优化] RadixAttention Prefix Cache
+    # 基于 Radix Tree 的子前缀复用，对标 SGLang RadixAttention。
+    # 支持任意子前缀共享，不仅限于完整前缀匹配。
+    use_radix_cache: bool = False
+    radix_cache_max_nodes: int = 10000
+
+    # 采样参数（默认值，可被请求级别覆盖）
     temperature: float = 0.7
     top_p: float = 0.9
 
+    # 投机解码配置（Speculative Decoding）
+    speculative_enabled: bool = False
+    speculative_draft_model_path: str = "./models/Qwen3-0.6B"
+    speculative_num_tokens: int = 5
+
+    # 推理模式: "kv_cache" | "eager" | "mock"
     #   - "kv_cache": ModelRunner + PagedAttention + 真实模型（O(1) per-token decode）
     #   - "eager": HF 模型原生 forward（O(n²) 每步重计，作为正确性 baseline）
     #   - "mock": scheduler + mock 采样（无真实推理，用于功能测试）
     inference_mode: str = "mock"
 
+    # 真实模型推理开关（False 时使用 mock 采样，保持向后兼容）
     use_real_model: bool = False
 
+    # 模型路径（use_real_model=True 时，若未传入 model 对象则从此路径加载）
     model_path: str = ""
+    # 模型推理精度
     dtype: str = "bfloat16"
 
     @classmethod
@@ -100,7 +137,7 @@ class InferenceConfig:
                          block_size=16, gpu_memory_fraction=0.3, **kwargs):
         """根据GPU显存自动配置KV Cache参数
 
-        查询可用显存，按比例分配给KV Cache，
+        [P1-2解决思路] 查询可用显存，按比例分配给KV Cache，
         计算可容纳的最大block数。避免手工配置导致OOM。
 
         Args:
@@ -181,6 +218,7 @@ class InferenceEngine:
         self._hf_model = None
         self._tokenizer = None
 
+        # 核心组件（initialize时创建）
         self._block_pool: Optional[BlockPool] = None
         self._kv_manager: Optional[KVCacheManager] = None
         self._scheduler: Optional[ContinuousBatchingScheduler] = None
@@ -188,9 +226,28 @@ class InferenceEngine:
         self._cuda_graph: Optional[CUDAGraphRunner] = None
         self._model_runner: Optional[ModelRunner] = None
 
+        # 投机解码器
+        self._speculative_decoder: Optional[SpeculativeDecoder] = None
+        if config.speculative_enabled:
+            spec_config = SpeculativeConfig(
+                enabled=True,
+                draft_model_path=config.speculative_draft_model_path,
+                num_speculative_tokens=config.speculative_num_tokens,
+            )
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            self._speculative_decoder = SpeculativeDecoder(spec_config, device)
+
+        # 请求跟踪
         self._requests: Dict[str, Request] = {}  # request_id → Request
         self._finished_outputs: Dict[str, List[int]] = {}  # 完成的请求输出
 
+        # [P1优化] 异步 Prefill-Decode 流调度的 CUDA Stream
+        self._prefill_stream: Optional[torch.cuda.Stream] = None
+        self._decode_stream: Optional[torch.cuda.Stream] = None
+        self._prefill_done_event: Optional[torch.cuda.Event] = None
+        self._enable_async_scheduling = config.enable_async_scheduling
+
+        # 统计
         self._step_count = 0
         self._total_prefill_tokens = 0
         self._total_decode_tokens = 0
@@ -209,6 +266,8 @@ class InferenceEngine:
         """
         cfg = self.config
 
+        # 0. 真实模型加载
+        # 兼容两种触发方式:
         #   - 旧方式: use_real_model=True
         #   - 新方式: inference_mode in ["eager", "kv_cache"]
         need_hf_model = (
@@ -224,8 +283,10 @@ class InferenceEngine:
             self._initialized = True
             return
 
+        # kv_cache 模式: 需要初始化 BlockPool + KVCacheManager + ModelRunner
         # mock 模式: 需要初始化全部组件
 
+        # 解析 dtype
         dtype_map = {
             "bfloat16": torch.bfloat16,
             "float16": torch.float16,
@@ -233,6 +294,7 @@ class InferenceEngine:
         }
         cache_dtype = dtype_map.get(cfg.dtype, torch.float16)
 
+        # 1. Block Pool — 预分配物理显存
         self._block_pool = BlockPool(
             num_blocks=cfg.num_blocks,
             block_size=cfg.block_size,
@@ -241,13 +303,16 @@ class InferenceEngine:
             head_dim=cfg.head_dim,
             dtype=cache_dtype,
             device="cuda",
+            cache_dtype=cfg.kv_cache_dtype,
         )
 
+        # 2. KV Cache Manager
         self._kv_manager = KVCacheManager(
             block_pool=self._block_pool,
             block_size=cfg.block_size,
         )
 
+        # kv_cache 模式: 初始化 ModelRunner 并绑定 HF 模型
         if cfg.inference_mode == "kv_cache" and self._hf_model is not None:
             runner_config = ModelRunnerConfig(
                 num_layers=cfg.num_layers,
@@ -260,16 +325,34 @@ class InferenceEngine:
                 max_num_blocks=cfg.num_blocks,
                 dtype=torch.bfloat16 if cfg.dtype == "bfloat16" else torch.float16,
                 device="cuda" if torch.cuda.is_available() else "cpu",
-                enable_cuda_graph=False,  # KV cache 路径暂不启用 CUDA Graph
+                enable_cuda_graph=cfg.enable_cuda_graph,
                 max_cuda_graph_batch_size=cfg.max_num_sequences,
             )
             self._model_runner = ModelRunner(None, runner_config)
+            # 绑定 HF 模型到 ModelRunner
             self._model_runner.bind_hf_model(self._hf_model)
+            # 绑定 KV Cache 张量
             if self._block_pool.kv_cache_tensor is not None:
-                self._model_runner.bind_kv_cache(self._block_pool.kv_cache_tensor)
+                self._model_runner.bind_kv_cache(
+                    self._block_pool.kv_cache_tensor,
+                    k_scale=self._block_pool.k_scale,
+                    v_scale=self._block_pool.v_scale,
+                    cache_dtype=self._block_pool.cache_dtype,
+                )
+
+            # CUDA Graph Runner (kv_cache 模式)
+            if cfg.enable_cuda_graph and torch.cuda.is_available():
+                self._cuda_graph = CUDAGraphRunner(
+                    max_batch_size=cfg.max_num_sequences,
+                    supported_batch_sizes=[1, 2, 4, 8],
+                )
+                # 预录制常见 batch_size（模型加载后立即执行）
+                self._pre_capture_cuda_graphs(device="cuda")
+
             self._initialized = True
             return
 
+        # 3. Scheduler (mock 模式需要)
         self._scheduler = ContinuousBatchingScheduler(
             max_num_batched_tokens=cfg.max_num_batched_tokens,
             max_num_sequences=cfg.max_num_sequences,
@@ -278,15 +361,25 @@ class InferenceEngine:
             chunk_size=cfg.chunk_size,
         )
 
+        # 4. Prefix Cache (可选)
         if cfg.enable_prefix_caching:
-            self._prefix_cache = PrefixCache(
-                block_size=cfg.block_size,
-                max_cached_blocks=cfg.max_cached_blocks,
-            )
+            if cfg.use_radix_cache:
+                # [P2优化] 使用 RadixAttention Prefix Cache
+                self._prefix_cache = RadixAttentionCache(
+                    block_size=cfg.block_size,
+                    max_nodes=cfg.radix_cache_max_nodes,
+                )
+            else:
+                self._prefix_cache = PrefixCache(
+                    block_size=cfg.block_size,
+                    max_cached_blocks=cfg.max_cached_blocks,
+                )
 
+        # 5. CUDA Graph Runner (可选)
         if cfg.enable_cuda_graph:
             self._cuda_graph = CUDAGraphRunner(max_batch_size=cfg.max_num_sequences)
 
+        # 6. ModelRunner（当传入真实模型且开启 use_real_model 时）
         if self._model is not None and cfg.use_real_model:
             runner_config = ModelRunnerConfig(
                 num_layers=cfg.num_layers,
@@ -303,8 +396,20 @@ class InferenceEngine:
                 max_cuda_graph_batch_size=cfg.max_num_sequences,
             )
             self._model_runner = ModelRunner(self._model, runner_config)
+            # 将 BlockPool 预分配的 KV Cache 绑定给 ModelRunner
             if self._block_pool.kv_cache_tensor is not None:
-                self._model_runner.bind_kv_cache(self._block_pool.kv_cache_tensor)
+                self._model_runner.bind_kv_cache(
+                    self._block_pool.kv_cache_tensor,
+                    k_scale=self._block_pool.k_scale,
+                    v_scale=self._block_pool.v_scale,
+                    cache_dtype=self._block_pool.cache_dtype,
+                )
+
+        # [P1优化] 初始化异步调度的 CUDA Streams
+        if self.config.enable_async_scheduling and torch.cuda.is_available():
+            self._prefill_stream = torch.cuda.Stream()
+            self._decode_stream = torch.cuda.Stream()
+            self._prefill_done_event = torch.cuda.Event()
 
         self._initialized = True
 
@@ -325,14 +430,28 @@ class InferenceEngine:
         }
         torch_dtype = dtype_map.get(self.config.dtype, torch.bfloat16)
 
-        self._hf_model = AutoModelForCausalLM.from_pretrained(
-            model_path,
-            dtype=torch_dtype,
-            trust_remote_code=True,
-            # 使用 eager attention 避免 SDPA/cuBLASLt 兼容性问题
-            # (PyTorch 2.12 + CUDA 13.0 + H20 上 SDPA 触发 cublasLtGetVersion 崩溃)
-            attn_implementation="eager",
-        )
+        # 尝试按优先级加载 attention 实现，自动降级
+        attn_implementations = ["flash_attention_2", "sdpa", "eager"]
+        model = None
+        for impl in attn_implementations:
+            try:
+                model = AutoModelForCausalLM.from_pretrained(
+                    model_path,
+                    dtype=torch_dtype,
+                    trust_remote_code=True,
+                    attn_implementation=impl,
+                )
+                logger.info(f"HF model loaded with attn_implementation='{impl}'")
+                break
+            except (ImportError, RuntimeError, ValueError) as e:
+                logger.debug(f"attn_implementation='{impl}' failed: {e}, trying next...")
+                continue
+
+        if model is None:
+            raise RuntimeError("All attention implementations failed to load")
+
+        self._hf_model = model
+        # 移动到 GPU
         if torch.cuda.is_available():
             self._hf_model = self._hf_model.to("cuda")
         self._hf_model.eval()
@@ -341,6 +460,7 @@ class InferenceEngine:
             model_path, trust_remote_code=True
         )
 
+        # 更新 config 中的模型参数（从实际加载的模型获取）
         hf_cfg = self._hf_model.config
         self.config.vocab_size = hf_cfg.vocab_size
         self.config.num_layers = hf_cfg.num_hidden_layers
@@ -391,6 +511,7 @@ class InferenceEngine:
         """
         assert self._initialized, "Engine not initialized."
 
+        # === Step 1: 调度 ===
         schedule_output: SchedulerOutput = self._scheduler.schedule()
         
         if schedule_output.is_empty:
@@ -398,12 +519,32 @@ class InferenceEngine:
 
         newly_finished: Dict[str, List[int]] = {}
 
-        if schedule_output.prefill_requests:
-            self._execute_prefill(schedule_output.prefill_requests)
+        # === Step 2 & 3: Prefill + Decode（支持异步流调度） ===
+        if self._enable_async_scheduling and self._prefill_stream is not None:
+            # 异步路径：prefill 和 decode 使用独立 CUDA Stream 实现流水线并行
+            if schedule_output.prefill_requests:
+                with torch.cuda.stream(self._prefill_stream):
+                    self._execute_prefill(schedule_output.prefill_requests)
+                self._prefill_done_event.record(self._prefill_stream)
 
-        if schedule_output.decode_requests:
-            self._execute_decode(schedule_output.decode_requests)
+            if schedule_output.decode_requests:
+                self._decode_stream.wait_event(self._prefill_done_event)
+                with torch.cuda.stream(self._decode_stream):
+                    self._execute_decode(schedule_output.decode_requests)
 
+            # 同步确保结果可用
+            torch.cuda.current_stream().wait_stream(self._decode_stream)
+            if schedule_output.prefill_requests and not schedule_output.decode_requests:
+                torch.cuda.current_stream().wait_stream(self._prefill_stream)
+        else:
+            # 原有同步路径
+            if schedule_output.prefill_requests:
+                self._execute_prefill(schedule_output.prefill_requests)
+
+            if schedule_output.decode_requests:
+                self._execute_decode(schedule_output.decode_requests)
+
+        # === Step 4: 检查完成的请求 ===
         for req in list(self._scheduler.running_queue):
             if req.is_finished:
                 newly_finished[req.request_id] = list(req.output_tokens)
@@ -411,6 +552,7 @@ class InferenceEngine:
                 self._kv_manager.free_sequence(req.request_id)
                 self._requests.pop(req.request_id, None)
 
+        # === Step 5: 处理被抢占的请求 ===
         for req in schedule_output.preempted_requests:
             self._kv_manager.free_sequence(req.request_id)
 
@@ -437,11 +579,13 @@ class InferenceEngine:
                 seq_id = request.request_id
                 prompt = request.prompt_tokens
 
+                # 1. 尝试匹配 Prefix Cache
                 matched_tokens = 0
                 cached_block_ids: List[int] = []
                 if self._prefix_cache is not None:
                     matched_tokens, cached_block_ids = self._prefix_cache.match_prefix(prompt)
 
+                # 2. 分配 KV Cache blocks
                 total_tokens = request.num_prompt_tokens
                 try:
                     block_table = self._kv_manager.allocate_for_sequence(seq_id, total_tokens)
@@ -449,9 +593,11 @@ class InferenceEngine:
                     # OOM: 无法分配，保持在 waiting 队列等下一步
                     continue
 
+                # 3. 计算需要处理的 token 数
                 tokens_to_compute = total_tokens - matched_tokens
                 self._total_prefill_tokens += tokens_to_compute
 
+                # 收集 ModelRunner 所需的序列信息
                 if self._model_runner is not None:
                     sequences_for_runner.append({
                         'token_ids': prompt,
@@ -462,12 +608,14 @@ class InferenceEngine:
                         'block_table_obj': block_table,
                     })
 
+                # 4. 注册到 Prefix Cache
                 if self._prefix_cache is not None and block_table is not None:
                     self._prefix_cache.insert(
                         token_ids=prompt,
                         block_ids=block_table.get_physical_block_ids(),
                     )
 
+                # 5. 更新请求状态
                 request.num_computed_tokens = total_tokens
 
             except Exception as e:
@@ -486,6 +634,7 @@ class InferenceEngine:
         if self._model_runner is not None and sequences_for_runner:
             input_ids, positions = self._model_runner.prepare_prefill(sequences_for_runner)
             logits = self._model_runner.run(input_ids, positions, is_prefill=True)
+            # Prefill 阶段对每个序列采样第一个 decode token
             # 取每个序列最后一个 token 的 logits
             cu_seqlens = [0]
             for seq_info in sequences_for_runner:
@@ -517,6 +666,7 @@ class InferenceEngine:
         failed_requests: List[str] = []  # 收集失败的请求ID，循环后统一清理
 
         if self._model_runner is not None:
+            # === 真实模型执行路径 ===
             sequences_for_runner = []
             for request in requests:
                 seq_id = request.request_id
@@ -535,6 +685,7 @@ class InferenceEngine:
             input_ids, positions = self._model_runner.prepare_decode(sequences_for_runner)
             logits = self._model_runner.run(input_ids, positions, is_prefill=False)
 
+            # 采样 + 更新状态
             sampled_tokens = self._model_runner.sample(
                 logits,
                 temperature=self.config.temperature,
@@ -544,6 +695,7 @@ class InferenceEngine:
                 try:
                     next_token = sampled_tokens[i] if i < len(sampled_tokens) else 2
                     request.output_tokens.append(next_token)
+                    # 更新 KV Cache: 新 token 需要存入 block
                     seq_id = request.request_id
                     success = self._kv_manager.append_token(seq_id)
                     if not success:
@@ -556,12 +708,15 @@ class InferenceEngine:
                         f"Decode post-processing failed for request {request.request_id}: "
                         f"{type(e).__name__}: {e}. Aborting this request."
                     )
+                    # 释放 KV Cache blocks
                     try:
                         self._kv_manager.free_sequence(request.request_id)
                     except Exception:
                         pass
                     failed_requests.append(request.request_id)
         else:
+            # === Mock 采样路径（无模型时的 fallback） ===
+            # 尝试 CUDA Graph（实际环境中）
             use_cuda_graph = (
                 self._cuda_graph is not None and
                 self._cuda_graph.is_captured(batch_size)
@@ -572,9 +727,11 @@ class InferenceEngine:
                     next_token = self._mock_sample(request)
                     request.output_tokens.append(next_token)
 
+                    # 更新 KV Cache: 新 token 需要存入 block
                     seq_id = request.request_id
                     success = self._kv_manager.append_token(seq_id)
                     if not success:
+                        # KV Cache OOM — 标记为需要抢占（下一步调度器处理）
                         logger.warning(
                             f"KV Cache append failed for request {request.request_id}, "
                             "marking for preemption."
@@ -584,6 +741,7 @@ class InferenceEngine:
                         f"Decode failed for request {request.request_id}: "
                         f"{type(e).__name__}: {e}. Aborting this request."
                     )
+                    # 释放 KV Cache blocks
                     try:
                         self._kv_manager.free_sequence(request.request_id)
                     except Exception:
@@ -599,20 +757,41 @@ class InferenceEngine:
 
     def _mock_sample(self, request: Request) -> int:
         """模拟采样（无真实模型时的placeholder）
-        
+
         实际实现:
-        1. 从model获取logits
+        1. 从 model获取logits
         2. temperature scaling: logits /= temperature  
         3. top-p filtering
         4. torch.multinomial 采样
-        
+
         生产环境这里应该调用真实的 Sampler 类。
         """
+        # 模拟: 随机生成token，有小概率生成EOS(2)以模拟终止
         if request.num_generated_tokens >= request.max_tokens - 1:
             return 2  # EOS
         if random.random() < 0.02:  # 2%概率自然结束
             return 2
         return random.randint(3, self.config.vocab_size - 1)
+    
+    @staticmethod
+    def _has_duplicate_prompts(prompts_tokens: List[List[int]]) -> bool:
+        """检查 batch 内是否存在重复的 prompt（K-sample 场景检测）
+    
+        Args:
+            prompts_tokens: 多个 prompt 的 token ids
+    
+        Returns:
+            True 如果存在至少两个相同的 prompt
+        """
+        if len(prompts_tokens) <= 1:
+            return False
+        seen = set()
+        for tokens in prompts_tokens:
+            key = tuple(tokens)
+            if key in seen:
+                return True
+            seen.add(key)
+        return False
 
     def generate(self, prompts_tokens: List[List[int]],
                  max_tokens: int = 512,
@@ -635,16 +814,32 @@ class InferenceEngine:
         Returns:
             每个 prompt 对应的生成结果 token ids，CUDA OOM 时返回 None
         """
+        # 路由逻辑（新 inference_mode 优先）
         if self.config.inference_mode == "eager":
             return self._generate_real(prompts_tokens, max_tokens, temperature)
         elif self.config.inference_mode == "kv_cache":
             return self._generate_kv_cache(prompts_tokens, max_tokens, temperature)
 
+        # 兼容旧配置: use_real_model + _hf_model → eager 路径
         if hasattr(self, '_hf_model') and self._hf_model is not None:
             return self._generate_real(prompts_tokens, max_tokens, temperature)
 
         # mock 路径: scheduler + mock 采样
         try:
+            # [P1优化] K-sample Prefix 复用: 在 mock 路径中，若启用 prefix_reuse
+            # 且全局 prefix_cache 未启用，临时创建一个用于 batch 内复用
+            if (self.config.enable_prefix_reuse
+                    and self._prefix_cache is None
+                    and self._has_duplicate_prompts(prompts_tokens)):
+                self._prefix_cache = PrefixCache(
+                    block_size=self.config.block_size,
+                    max_cached_blocks=self.config.max_cached_blocks,
+                )
+                _temp_prefix_cache = True
+            else:
+                _temp_prefix_cache = False
+
+            # 添加所有请求
             request_ids = []
             for i, tokens in enumerate(prompts_tokens):
                 req_id = f"req_{time.time_ns()}_{i}"
@@ -652,6 +847,7 @@ class InferenceEngine:
                               temperature=temperature)
                 request_ids.append(req_id)
 
+            # 循环 step 直到所有请求完成
             all_outputs: Dict[str, List[int]] = {}
             max_steps = max_tokens + max(len(t) for t in prompts_tokens) + 10
 
@@ -667,6 +863,11 @@ class InferenceEngine:
             results = []
             for req_id in request_ids:
                 results.append(all_outputs.get(req_id, []))
+
+            # [P1优化] 清理临时 prefix cache
+            if _temp_prefix_cache:
+                self._prefix_cache = None
+
             return results
 
         except torch.cuda.OutOfMemoryError:
@@ -674,10 +875,13 @@ class InferenceEngine:
                 "CUDA OOM during inference generation. "
                 "Clearing KV cache and returning None."
             )
+            # 清理 GPU 缓存
             torch.cuda.empty_cache()
+            # 清理 KV Cache Manager — 释放所有序列的 blocks
             if self._kv_manager is not None:
                 for seq_id in list(self._kv_manager._seq_tables.keys()):
                     self._kv_manager.free_sequence(seq_id)
+            # 清理 Prefix Cache（KV 值已失效）
             if self._prefix_cache is not None:
                 self._prefix_cache.invalidate_all()
             # 清除 CUDA Graph（可能已损坏）
@@ -723,6 +927,7 @@ class InferenceEngine:
             model = self._hf_model
             device = next(model.parameters()).device
 
+            # 获取 EOS token id
             eos_token_id = getattr(model.config, 'eos_token_id', 151645)
             if isinstance(eos_token_id, list):
                 eos_token_ids = set(eos_token_id)
@@ -737,18 +942,23 @@ class InferenceEngine:
                 generated_tokens: List[int] = []
 
                 for step in range(max_tokens):
+                    # Forward: 完整序列送入模型
                     outputs = model(input_ids)
+                    # outputs.logits shape: [1, seq_len, vocab_size]
                     next_token_logits = outputs.logits[:, -1, :]  # [1, vocab_size]
 
+                    # 采样
                     next_token_id = self._sample_from_logits(
                         next_token_logits, temperature=temperature, top_p=self.config.top_p
                     )
 
                     generated_tokens.append(next_token_id)
 
+                    # 检查 EOS
                     if next_token_id in eos_token_ids:
                         break
 
+                    # 拼接 next token 到 input_ids
                     next_token_tensor = torch.tensor(
                         [[next_token_id]], dtype=torch.long, device=device
                     )
@@ -783,10 +993,13 @@ class InferenceEngine:
             logits = logits[0]  # [vocab_size]
 
         if temperature <= 0:
+            # Greedy
             return int(torch.argmax(logits).item())
 
+        # Temperature scaling
         scaled_logits = logits.float() / temperature
 
+        # Top-p filtering
         if top_p < 1.0:
             sorted_logits, sorted_indices = torch.sort(scaled_logits, descending=True)
             probs = torch.softmax(sorted_logits, dim=-1)
@@ -798,6 +1011,7 @@ class InferenceEngine:
             mask[0] = False
             sorted_logits[mask] = float('-inf')
 
+            # 还原到原始顺序
             scaled_logits = torch.zeros_like(scaled_logits).scatter_(
                 0, sorted_indices, sorted_logits
             )
@@ -816,12 +1030,18 @@ class InferenceEngine:
 
         原理:
         - Prefill: 完整序列 forward（use_cache=True），KV 存入 paged block pool
-        - Decode: 每步仅 forward 1 个新 token，从 paged cache 加载历史 KV
+        - Decode: 收集所有 active 序列的当前 token，组成 batch tensor，
+                  一次 forward 产出所有序列的 next-token logits（Batched Decode）
         - 通过 paged KV cache 实现 O(1) per-token decode（仅计算单 token 的 MLP/Attention）
 
         与 eager 路径的对比:
         - eager: 每步 forward 完整序列（O(n²) 总计算量）
         - kv_cache: prefill O(n) + decode O(1) per step = O(n) 总计算量
+
+        Batched Decode 优势:
+        - 多序列共享一次 model forward，显著提升 GPU 利用率
+        - 不同序列的 KV block 互相独立（通过 block_tables 索引）
+        - 不同序列可能有不同的 context_lens，attention 中正确 mask
 
         Args:
             prompts_tokens: 多个 prompt 的 token ids
@@ -842,38 +1062,143 @@ class InferenceEngine:
             else:
                 device = next(self._hf_model.parameters()).device
 
+            # 获取 EOS token id
             eos_token_id = getattr(self._hf_model.config, 'eos_token_id', 151645)
             if isinstance(eos_token_id, list):
                 eos_token_ids = set(eos_token_id)
             else:
                 eos_token_ids = {eos_token_id}
 
-            results: List[List[int]] = []
+            block_size = self.config.block_size
+            num_seqs = len(prompts_tokens)
+
+            # === 每个序列的状态跟踪 ===
+            @dataclass
+            class SeqState:
+                seq_id: str
+                prompt_idx: int
+                block_table: object  # KVCacheManager 返回的 block table
+                generated_tokens: List[int] = field(default_factory=list)
+                current_len: int = 0  # 当前已处理的总 token 数（prompt + generated）
+                finished: bool = False
+
+            seq_states: List[SeqState] = []
+
+            # === Phase 1: Prefill — 逐序列执行（支持 K-sample Prefix 复用） ===
+            from .context import set_context, reset_context
+
+            # [P1优化] K-sample Prefix 复用:
+            # 同一 batch 内多个相同 prompt，第一个 prefill 后注册 cache，后续复用
+            enable_prefix_reuse = self.config.enable_prefix_reuse
+            # 临时 prefix cache（用于 batch 内复用，即使全局 prefix_cache 未启用）
+            batch_prefix_cache = None
+            if enable_prefix_reuse:
+                from .prefix_cache import PrefixCache
+                batch_prefix_cache = PrefixCache(
+                    block_size=block_size,
+                    max_cached_blocks=self.config.max_cached_blocks,
+                )
 
             for prompt_idx, prompt_tokens in enumerate(prompts_tokens):
                 seq_id = f"kv_seq_{time.time_ns()}_{prompt_idx}"
                 num_prompt_tokens = len(prompt_tokens)
 
+                # [P1优化] K-sample Prefix 复用: 尝试匹配 batch 内已缓存的前缀
+                matched_tokens = 0
+                cached_block_ids: List[int] = []
+                if batch_prefix_cache is not None:
+                    matched_tokens, cached_block_ids = batch_prefix_cache.match_prefix(prompt_tokens)
+                    # [FIX] 临时禁用 prefix 跳过逻辑：当前实现获取 cached_block_ids 后
+                    # 仍分配全新 block，但跳过 prefill 会导致从空 block 读取垃圾 KV 数据。
+                    # TODO: 实现 block 共享/复制后可重新启用。
+                    matched_tokens = 0
+
+                # 分配 KV Cache blocks
                 try:
                     block_table = self._kv_manager.allocate_for_sequence(
                         seq_id, num_prompt_tokens
                     )
                 except RuntimeError as e:
                     logger.error(f"Cannot allocate blocks for prompt {prompt_idx}: {e}")
-                    results.append([])
+                    # 标记为已完成（空结果）
+                    seq_states.append(SeqState(
+                        seq_id=seq_id, prompt_idx=prompt_idx,
+                        block_table=None, finished=True,
+                    ))
                     continue
 
+                # 如果前缀完全命中（所有 full blocks 都匹配），可以跳过大部分 prefill
+                if matched_tokens > 0 and matched_tokens >= (num_prompt_tokens // block_size) * block_size:
+                    # 完全复用: 只需处理尾部不足一个 block 的 token
+                    remaining_tokens = num_prompt_tokens - matched_tokens
+                    if remaining_tokens > 0:
+                        # 对尾部 token 做轻量 prefill
+                        tail_tokens = prompt_tokens[matched_tokens:]
+                        input_ids = torch.tensor(tail_tokens, dtype=torch.long, device=device)
+                        positions = torch.arange(
+                            matched_tokens, num_prompt_tokens, dtype=torch.long, device=device
+                        )
+                        block_ids = block_table.get_physical_block_ids()
+                        slot_mapping = self._compute_slot_mapping(
+                            block_ids, matched_tokens, remaining_tokens, block_size, device
+                        )
+                        set_context(
+                            is_prefill=True,
+                            cu_seqlens_q=torch.tensor([0, remaining_tokens], dtype=torch.int32, device=device),
+                            cu_seqlens_k=torch.tensor([0, num_prompt_tokens], dtype=torch.int32, device=device),
+                            max_seqlen_q=remaining_tokens,
+                            max_seqlen_k=num_prompt_tokens,
+                            slot_mapping=slot_mapping,
+                            block_tables=None,
+                        )
+                        logits = self._model_runner.run(input_ids, positions, is_prefill=True)
+                        last_logits = logits[-1:]
+                    else:
+                        # 全部命中，无需 prefill，但仍需获取 last token logits
+                        # 做一次单 token forward 获取 logits
+                        last_token = prompt_tokens[-1]
+                        input_ids = torch.tensor([last_token], dtype=torch.long, device=device)
+                        positions = torch.tensor([num_prompt_tokens - 1], dtype=torch.long, device=device)
+                        block_ids = block_table.get_physical_block_ids()
+                        block_tables_tensor = torch.tensor([block_ids], dtype=torch.int32, device=device)
+                        ctx_lens = torch.tensor([num_prompt_tokens], dtype=torch.int32, device=device)
+                        last_slot_idx = (num_prompt_tokens - 1) // block_size
+                        last_slot_offset = (num_prompt_tokens - 1) % block_size
+                        decode_slot = block_ids[last_slot_idx] * block_size + last_slot_offset
+                        slot_mapping = torch.tensor([decode_slot], dtype=torch.int32, device=device)
+                        set_context(
+                            is_prefill=False,
+                            slot_mapping=slot_mapping,
+                            context_lens=ctx_lens,
+                            block_tables=block_tables_tensor,
+                        )
+                        logits = self._model_runner.run(input_ids, positions, is_prefill=False)
+                        last_logits = logits[-1:]
+
+                    next_token_id = self._sample_from_logits(
+                        last_logits, temperature=temperature, top_p=self.config.top_p
+                    )
+
+                    state = SeqState(
+                        seq_id=seq_id,
+                        prompt_idx=prompt_idx,
+                        block_table=block_table,
+                        generated_tokens=[next_token_id],
+                        current_len=num_prompt_tokens,
+                        finished=(next_token_id in eos_token_ids),
+                    )
+                    seq_states.append(state)
+                    continue
+
+                # 正常 Prefill forward（无命中或部分命中）
                 input_ids = torch.tensor(prompt_tokens, dtype=torch.long, device=device)
                 positions = torch.arange(num_prompt_tokens, dtype=torch.long, device=device)
 
-                # 计算 slot_mapping: 每个 token 对应的物理 slot
                 block_ids = block_table.get_physical_block_ids()
-                block_size = self.config.block_size
                 slot_mapping = self._compute_slot_mapping(
                     block_ids, 0, num_prompt_tokens, block_size, device
                 )
 
-                from .context import set_context, reset_context
                 set_context(
                     is_prefill=True,
                     cu_seqlens_q=torch.tensor([0, num_prompt_tokens], dtype=torch.int32, device=device),
@@ -885,54 +1210,142 @@ class InferenceEngine:
                 )
 
                 logits = self._model_runner.run(input_ids, positions, is_prefill=True)
+                # 取最后一个 token 的 logits 做采样
                 last_logits = logits[-1:]  # [1, vocab]
                 next_token_id = self._sample_from_logits(
                     last_logits, temperature=temperature, top_p=self.config.top_p
                 )
 
-                generated_tokens: List[int] = [next_token_id]
+                # [P1优化] Prefill 完成后立即注册到 batch prefix cache，供后续相同 prompt 复用
+                if batch_prefix_cache is not None:
+                    batch_prefix_cache.insert(
+                        token_ids=prompt_tokens,
+                        block_ids=block_ids,
+                    )
 
-                current_len = num_prompt_tokens
-                for step in range(max_tokens - 1):
-                    if next_token_id in eos_token_ids:
-                        break
+                state = SeqState(
+                    seq_id=seq_id,
+                    prompt_idx=prompt_idx,
+                    block_table=block_table,
+                    generated_tokens=[next_token_id],
+                    current_len=num_prompt_tokens,
+                    finished=(next_token_id in eos_token_ids),
+                )
+                seq_states.append(state)
 
-                    # 为新 token 分配 slot（可能分配新 block）
-                    success = self._kv_manager.append_token(seq_id)
+            # 投机解码器初始化（延迟加载 draft model）
+            spec_decoder = self._speculative_decoder
+            if spec_decoder is not None and spec_decoder.config.enabled and not spec_decoder.is_loaded:
+                spec_decoder.load_draft_model()
+
+            # === Phase 2: Batched Decode 循环 ===
+            for step in range(max_tokens - 1):
+                # 收集所有未完成序列
+                active_states = [s for s in seq_states if not s.finished]
+                if not active_states:
+                    break
+
+                # 为每个 active 序列的新 token 分配 KV slot
+                still_active = []
+                for state in active_states:
+                    success = self._kv_manager.append_token(state.seq_id)
                     if not success:
-                        logger.warning(f"KV cache full for seq {prompt_idx}, stopping early")
-                        break
-                    current_len += 1
+                        logger.warning(
+                            f"KV cache full for seq {state.prompt_idx}, stopping early"
+                        )
+                        state.finished = True
+                    else:
+                        state.current_len += 1
+                        still_active.append(state)
 
-                    # 新 token 的 slot_mapping
-                    block_ids = block_table.get_physical_block_ids()
-                    token_pos = current_len - 1
+                if not still_active:
+                    break
+
+                # === 投机解码分支（单序列时可启用） ===
+                use_speculative = (
+                    spec_decoder is not None
+                    and spec_decoder.config.enabled
+                    and spec_decoder.is_loaded
+                    and spec_decoder.acceptance_rate > 0.5
+                    and len(still_active) == 1
+                )
+
+                if use_speculative:
+                    state = still_active[0]
+                    # 构造当前完整序列
+                    all_tokens = list(prompts_tokens[state.prompt_idx]) + state.generated_tokens
+                    input_ids_for_spec = torch.tensor(
+                        [all_tokens], dtype=torch.long, device=device
+                    )
+
+                    # 1. Draft model 生成 K 个候选 token
+                    draft_tokens, draft_logits = spec_decoder.speculate(input_ids_for_spec)
+                    K = draft_tokens.shape[0]
+
+                    # 2. 构造 target model 输入：原始序列 + K 个候选
+                    #    Target model 一次 forward 得到 K+1 个 logits
+                    spec_input_ids = torch.cat([
+                        input_ids_for_spec,
+                        draft_tokens.unsqueeze(0),  # [1, K]
+                    ], dim=1)  # [1, seq_len + K]
+
+                    # Target model forward (eager 模式，不走 KV cache 以保持简单)
+                    target_outputs = self._hf_model(spec_input_ids)
+                    # logits: [1, seq_len+K, vocab]
+                    # 我们需要从 seq_len-1 开始的 K+1 个 logits
+                    seq_len = len(all_tokens)
+                    target_logits = target_outputs.logits[:, seq_len - 1:seq_len + K, :]  # [1, K+1, vocab]
+
+                    # 3. 验证
+                    accepted_tokens, num_accepted = spec_decoder.verify(
+                        input_ids_for_spec, draft_tokens, target_logits
+                    )
+
+                    # 4. 追加所有接受的 token
+                    for token_id in accepted_tokens.tolist():
+                        state.generated_tokens.append(token_id)
+                        if token_id in eos_token_ids or len(state.generated_tokens) >= max_tokens:
+                            state.finished = True
+                            break
+                        # 为后续 token 分配 KV slot（除了第一个已经 append 过的）
+                        if token_id != accepted_tokens[0].item():
+                            extra_success = self._kv_manager.append_token(state.seq_id)
+                            if not extra_success:
+                                state.finished = True
+                                break
+                            state.current_len += 1
+
+                    continue
+
+                # === 单序列 fallback: 只有 1 个 active 序列时走原有单序列路径 ===
+                if len(still_active) == 1:
+                    state = still_active[0]
+                    last_token = state.generated_tokens[-1]
+                    token_pos = state.current_len - 1
+                    block_ids = state.block_table.get_physical_block_ids()
+
                     new_block_idx = token_pos // block_size
                     new_offset = token_pos % block_size
                     new_slot = block_ids[new_block_idx] * block_size + new_offset
                     decode_slot_mapping = torch.tensor(
                         [new_slot], dtype=torch.int32, device=device
                     )
-
-                    # block_tables tensor: [1, num_blocks]
                     block_tables_tensor = torch.tensor(
                         [block_ids], dtype=torch.int32, device=device
                     )
-
-                    # context_lens: 包含当前 token 的完整长度
-                    context_lens = torch.tensor(
-                        [current_len], dtype=torch.int32, device=device
+                    ctx_lens = torch.tensor(
+                        [state.current_len], dtype=torch.int32, device=device
                     )
 
                     set_context(
                         is_prefill=False,
                         slot_mapping=decode_slot_mapping,
-                        context_lens=context_lens,
+                        context_lens=ctx_lens,
                         block_tables=block_tables_tensor,
                     )
 
                     decode_input = torch.tensor(
-                        [next_token_id], dtype=torch.long, device=device
+                        [last_token], dtype=torch.long, device=device
                     )
                     decode_pos = torch.tensor(
                         [token_pos], dtype=torch.long, device=device
@@ -944,10 +1357,82 @@ class InferenceEngine:
                     next_token_id = self._sample_from_logits(
                         logits, temperature=temperature, top_p=self.config.top_p
                     )
-                    generated_tokens.append(next_token_id)
+                    state.generated_tokens.append(next_token_id)
+                    if next_token_id in eos_token_ids or len(state.generated_tokens) >= max_tokens:
+                        state.finished = True
+                    continue
 
-                self._kv_manager.free_sequence(seq_id)
-                results.append(generated_tokens)
+                # === Batched decode: 多序列共享一次 forward ===
+                batch_size = len(still_active)
+
+                # 收集 batch tensors
+                input_ids_list = []
+                positions_list = []
+                block_tables_list = []
+                context_lens_list = []
+
+                for state in still_active:
+                    last_token = state.generated_tokens[-1]
+                    token_pos = state.current_len - 1
+                    block_ids = state.block_table.get_physical_block_ids()
+
+                    input_ids_list.append(last_token)
+                    positions_list.append(token_pos)
+                    block_tables_list.append(block_ids)
+                    context_lens_list.append(state.current_len)
+
+                # 构造 batch tensors
+                batch_input_ids = torch.tensor(
+                    input_ids_list, dtype=torch.long, device=device
+                )
+                batch_positions = torch.tensor(
+                    positions_list, dtype=torch.long, device=device
+                )
+                batch_context_lens = torch.tensor(
+                    context_lens_list, dtype=torch.int32, device=device
+                )
+
+                # block_tables: [batch_size, max_blocks] — 需要 padding 到统一长度
+                max_blocks = max(len(bt) for bt in block_tables_list)
+                batch_block_tables = torch.zeros(
+                    batch_size, max_blocks, dtype=torch.int32, device=device
+                )
+                for i, bt in enumerate(block_tables_list):
+                    for j, block_id in enumerate(bt):
+                        batch_block_tables[i, j] = block_id
+
+                # === CUDA Graph capture/replay 加速 ===
+                logits = self._try_cuda_graph_decode(
+                    batch_size=batch_size,
+                    input_ids=batch_input_ids,
+                    positions=batch_positions,
+                    block_tables=batch_block_tables,
+                    context_lens=batch_context_lens,
+                    max_blocks=max_blocks,
+                    device=device,
+                )
+                # logits: [batch_size, vocab_size]
+
+                # 逐序列采样 next_token
+                for i, state in enumerate(still_active):
+                    seq_logits = logits[i:i + 1]  # [1, vocab_size]
+                    next_token_id = self._sample_from_logits(
+                        seq_logits, temperature=temperature, top_p=self.config.top_p
+                    )
+                    state.generated_tokens.append(next_token_id)
+                    # 检查终止条件
+                    if next_token_id in eos_token_ids or len(state.generated_tokens) >= max_tokens:
+                        state.finished = True
+
+            # === 收集结果并释放资源 ===
+            results: List[List[int]] = []
+            # 按 prompt_idx 排序输出
+            seq_states.sort(key=lambda s: s.prompt_idx)
+            for state in seq_states:
+                results.append(state.generated_tokens)
+                # 释放 KV Cache blocks
+                if state.block_table is not None:
+                    self._kv_manager.free_sequence(state.seq_id)
 
             return results
 
@@ -991,6 +1476,155 @@ class InferenceEngine:
             slots.append(physical_slot)
         return torch.tensor(slots, dtype=torch.int32, device=device)
 
+    def _try_cuda_graph_decode(
+        self,
+        batch_size: int,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        block_tables: torch.Tensor,
+        context_lens: torch.Tensor,
+        max_blocks: int,
+        device,
+    ) -> torch.Tensor:
+        """Decode 阶段尝试使用 CUDA Graph 加速，失败时 fallback 到 eager 执行
+
+        CUDA Graph 适用条件:
+        - enable_cuda_graph 配置开启
+        - batch_size 在支持范围内
+        - 非 HF 模型路径（HF 模型的 Python 级 KV 加载不兼容 Graph）
+          或已成功录制过
+
+        Args:
+            batch_size: 当前 batch 大小
+            input_ids: [batch_size] token ids
+            positions: [batch_size] position ids
+            block_tables: [batch_size, max_blocks] block table
+            context_lens: [batch_size] context lengths
+            max_blocks: 最大 block 数
+            device: 设备
+
+        Returns:
+            logits: [batch_size, vocab_size]
+        """
+        # 检查是否可以使用 CUDA Graph
+        use_cuda_graph = (
+            self._cuda_graph is not None
+            and self.config.enable_cuda_graph
+            and torch.cuda.is_available()
+            and self._cuda_graph._get_padded_batch_size(batch_size) is not None
+        )
+
+        if use_cuda_graph:
+            padded_bs = self._cuda_graph._get_padded_batch_size(batch_size)
+
+            # 尝试录制（首次遇到未录制的 batch_size）
+            if not self._cuda_graph.is_captured(batch_size):
+                try:
+                    self._capture_decode_graph(
+                        batch_size=padded_bs,
+                        max_blocks=max(max_blocks, self.config.num_blocks // 4),
+                        device=device,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"CUDA Graph capture failed for batch_size={padded_bs}: "
+                        f"{type(e).__name__}: {e}. Falling back to eager execution."
+                    )
+
+            # 尝试回放
+            if self._cuda_graph.is_captured(batch_size):
+                try:
+                    graph_logits = self._cuda_graph.replay(
+                        batch_size=batch_size,
+                        input_ids=input_ids,
+                        positions=positions,
+                        block_tables=block_tables,
+                        context_lens=context_lens,
+                    )
+                    if graph_logits is not None:
+                        return graph_logits
+                except Exception as e:
+                    logger.warning(
+                        f"CUDA Graph replay failed: {type(e).__name__}: {e}. "
+                        "Falling back to eager execution."
+                    )
+
+        # Fallback: eager 执行
+        return self._model_runner.run_batch_decode(
+            input_ids=input_ids,
+            positions=positions,
+            block_tables=block_tables,
+            context_lens=context_lens,
+        )
+
+    def _capture_decode_graph(
+        self,
+        batch_size: int,
+        max_blocks: int,
+        device,
+    ):
+        """Decode 阶段 CUDA Graph 录制
+
+        将 model_runner.run_batch_decode 包装为 CUDA Graph 可录制的 forward 函数。
+        录制期间执行一次完整 forward，之后 replay 时复用录制的 kernel 序列。
+
+        Args:
+            batch_size: 要录制的 batch_size
+            max_blocks: block_tables 的第二维大小
+            device: 设备
+        """
+        vocab_size = self.config.vocab_size
+
+        def model_forward_fn(input_ids, positions, **extra_buffers):
+            """CUDA Graph 录制用的 forward 函数"""
+            block_tables = extra_buffers.get('block_tables')
+            context_lens = extra_buffers.get('context_lens')
+            return self._model_runner.run_batch_decode(
+                input_ids=input_ids,
+                positions=positions,
+                block_tables=block_tables,
+                context_lens=context_lens,
+            )
+
+        self._cuda_graph.capture(
+            model_forward_fn=model_forward_fn,
+            batch_size=batch_size,
+            input_ids_shape=(batch_size,),
+            hidden_size=vocab_size,  # 输出维度是 vocab_size
+            device=device,
+            dtype=torch.float32,  # logits 为 float32
+            num_warmup=3,
+            block_tables=(batch_size, max_blocks),
+            context_lens=(batch_size,),
+        )
+        logger.info(f"CUDA Graph captured for decode batch_size={batch_size}")
+
+    def _pre_capture_cuda_graphs(self, device: str = "cuda"):
+        """Pre-capture CUDA Graphs for common batch sizes [1, 2, 4, 8]
+
+        在模型加载完成后调用，避免首次使用时的录制延迟。
+        如果录制失败（如 CUDA 兼容性问题），静默跳过，runtime 时会 fallback 到 eager。
+        """
+        if self._cuda_graph is None:
+            return
+
+        # 预分配的 block_tables 第二维使用保守值
+        max_blocks_for_graph = min(self.config.num_blocks // 4, 64)
+
+        for bs in [1, 2, 4, 8]:
+            try:
+                self._capture_decode_graph(
+                    batch_size=bs,
+                    max_blocks=max_blocks_for_graph,
+                    device=device,
+                )
+            except Exception as e:
+                logger.debug(
+                    f"Pre-capture failed for batch_size={bs}: "
+                    f"{type(e).__name__}: {e}. Will retry at runtime or fallback."
+                )
+                break  # 如果一个失败，后续的可能也会失败
+
     def on_weights_updated(self):
         """权重更新后的清理工作
         
@@ -1004,15 +1638,19 @@ class InferenceEngine:
         
         Orchestrator 在 weight_sync 完成后调用此方法。
         """
+        # 1. 清除 Prefix Cache
         if self._prefix_cache is not None:
             self._prefix_cache.invalidate_all()
 
+        # 2. 清除 CUDA Graph
         if self._cuda_graph is not None:
             self._cuda_graph.invalidate()
 
+        # 2.5 清除 ModelRunner 的 CUDA Graph
         if self._model_runner is not None:
             self._model_runner.invalidate_cuda_graphs()
 
+        # 3. Abort 所有 running 序列（释放 KV Cache）
         if self._scheduler is not None:
             for req in list(self._scheduler.running_queue):
                 self._kv_manager.free_sequence(req.request_id)

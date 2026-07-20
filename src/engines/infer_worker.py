@@ -63,6 +63,7 @@ def _create_infer_worker_class():
             self._engine = None
             self._custom_engine = None  # 自研引擎实例
             self._tokenizer = None  # tokenizer实例（用于custom backend）
+            self._double_buffer = None  # SwiftSync DoubleBufferedLoRA instance
             self._initialized = False
             self._total_generate_time = 0.0
             self._total_requests = 0
@@ -168,9 +169,10 @@ def _create_infer_worker_class():
             temperature: float,
         ) -> List[List[str]]:
             """使用自研InferenceEngine后端生成
-
+        
             使用transformers AutoTokenizer进行encode/decode。
             每个prompt重复num_samples次以模拟多回复采样。
+            通过将同一prompt的K个副本堆叠为一次batch调用来提升吞吐。
             """
             # 懒加载tokenizer
             if self._tokenizer is None:
@@ -178,38 +180,44 @@ def _create_infer_worker_class():
                 self._tokenizer = AutoTokenizer.from_pretrained(
                     self.model_path, trust_remote_code=True
                 )
-
+        
             results: List[List[str]] = []
             for prompt in prompts:
-                samples = []
-                for _ in range(num_samples):
-                    prompt_tokens = self._tokenizer.encode(prompt)
-                    output_tokens_list = self._custom_engine.generate(
-                        [prompt_tokens],
-                        max_tokens=max_tokens,
-                        temperature=temperature,
+                prompt_tokens = self._tokenizer.encode(prompt)
+                # 将同一prompt的K个副本堆叠，一次batch调用
+                batch_input = [prompt_tokens] * num_samples
+                output_tokens_list = self._custom_engine.generate(
+                    batch_input,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                )
+                if output_tokens_list is None:
+                    logger.error(
+                        "Inference generation failed (OOM), returning empty results for this prompt"
                     )
-                    if output_tokens_list is None:
-                        logger.error(
-                            "Inference generation failed (OOM), returning empty result for this sample"
-                        )
-                        samples.append("")
-                        continue
-                    output_tokens = output_tokens_list[0] if output_tokens_list else []
-                    text = self._tokenizer.decode(output_tokens, skip_special_tokens=True)
+                    results.append([""] * num_samples)
+                    continue
+                # 按原始prompt索引重组结果
+                samples = []
+                for i in range(num_samples):
+                    if i < len(output_tokens_list) and output_tokens_list[i]:
+                        text = self._tokenizer.decode(output_tokens_list[i], skip_special_tokens=True)
+                    else:
+                        text = ""
                     samples.append(text)
                 results.append(samples)
             return results
 
-        def update_weights(self, state_dict: Dict[str, torch.Tensor]) -> bool:
+        def update_weights(self, state_dict: Dict[str, torch.Tensor], mode: str = "full") -> bool:
             """热更新模型权重
 
-            根据backend选择不同的权重更新策略:
-            - vLLM: 直接替换模型参数
-            - custom: 调用 engine.on_weights_updated() 清除缓存
+            根据backend和mode选择不同的权重更新策略:
+            - mode="full": 全量更新（原有逻辑）
+            - mode="delta": 增量更新（SwiftSync）
 
             Args:
-                state_dict: 新的模型权重
+                state_dict: 权重字典（full模式为完整state_dict，delta模式为增量）
+                mode: "full" 全量更新 | "delta" 增量更新（SwiftSync）
 
             Returns:
                 bool: 更新是否成功
@@ -217,7 +225,22 @@ def _create_infer_worker_class():
             assert self._initialized, "InferWorker not initialized."
 
             try:
-                if self.backend == "custom":
+                if mode == "delta":
+                    from ..transfer.swift_sync import DoubleBufferedLoRA
+                    if self._double_buffer is None:
+                        # 首次：用 delta 作为初始 LoRA 状态初始化双缓冲
+                        self._double_buffer = DoubleBufferedLoRA(state_dict)
+                        logger.info("SwiftSync: DoubleBufferedLoRA initialized with %d params", len(state_dict))
+                    else:
+                        self._double_buffer.apply_delta_to_shadow(state_dict)
+                        version = self._double_buffer.swap_buffers()
+                        logger.debug("SwiftSync: Buffer swapped to version %d", version)
+                    # 通知推理引擎（仅清 prefix cache，不 abort running requests）
+                    if self._custom_engine:
+                        self._custom_engine.on_weights_updated()
+                    self._weight_version += 1
+                    return True
+                elif self.backend == "custom":
                     # 自研引擎: 通知权重已更新，清除所有缓存
                     self._custom_engine.on_weights_updated()
                     self._weight_version += 1

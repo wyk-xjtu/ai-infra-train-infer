@@ -1,0 +1,77 @@
+# Supervised fine-tuning config.
+# 4-GPU DP full dataset experiment on H20.
+
+experiment:
+  name: "qwen3_4b_sft_dp4"
+  stage: "sft"
+  seed: 42
+  output_dir: "outputs/sft/qwen3_4b_dp4"
+
+runtime:
+  device: "auto"
+  precision: "bf16"
+  tp_size: 1
+  dp_size: 4
+  inference_backend: "custom"
+  deterministic: false
+
+model:
+  name_or_path: "./models/Qwen3-4B"
+  max_seq_len: 2048
+  trust_remote_code: true
+  use_flash_attn: true
+  attention_backend: "flash_attn"
+
+data:
+  dataset_name: "yahma/alpaca-cleaned"
+  dataset_config: null
+  split: "train"
+  max_samples: null          # 使用全部 51760 条
+  prompt_template: "qwen3_instruction"
+  prompt_field: "instruction"
+  input_field: "input"
+  response_field: "output"
+  answer_field: null
+
+training:
+  mode: "sft"
+  total_iterations: 810         # 1 epoch: 51760 / (4 bs × 4 grad_accum × 4 dp) ≈ 809 steps
+  batch_size: 4
+  train_steps_per_iteration: 1
+  gradient_accumulation_steps: 4
+  learning_rate: 2.0e-5
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  # LR Scheduler
+  lr_scheduler: "cosine"
+  warmup_steps: 100
+  min_lr_ratio: 0.1
+
+lora:
+  enabled: true
+  rank: 32
+  alpha: 64
+  dropout: 0.05
+  target_modules:
+    - "q_proj"
+    - "k_proj"
+    - "v_proj"
+    - "o_proj"
+    - "gate_proj"
+    - "up_proj"
+    - "down_proj"
+
+inference_preview:
+  enabled: true
+  max_tokens: 1
+  temperature: 0.7
+  top_p: 0.95
+
+eval:
+  max_tokens: 512
+  num_prompts: 5
+
+checkpoint:
+  save_dir: "checkpoints/sft/qwen3_4b_dp4"
+  save_interval: 1000
+  resume_from: null

@@ -45,7 +45,9 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+# ============================================================
 # 异常分类: 区分可重试异常与不可重试异常
+# ============================================================
 
 # 可重试异常 — 网络/连接类暂时性故障，重试可能恢复
 RETRIABLE_EXCEPTIONS = (
@@ -408,9 +410,11 @@ class IPCWeightTransfer:
         self._tensor_refs.clear()
 
         try:
+            # Step 1: 暂停vLLM
             logger.info("Step 1: Putting vLLM to sleep...")
             await self.client.sleep(level=sleep_level)
 
+            # Step 2: 构建IPC handles（含 CUDA OOM 重试）
             logger.info("Step 2: Building IPC handles...")
             try:
                 handles = self.build_ipc_handles(state_dict)
@@ -423,10 +427,12 @@ class IPCWeightTransfer:
                 self._tensor_refs.clear()
                 handles = self.build_ipc_handles(state_dict)
 
+            # Step 3: 初始化并开始权重更新
             logger.info("Step 3: Initializing weight transfer...")
             await self.client.init_weight_transfer()
             await self.client.start_weight_update(is_checkpoint_format=True)
 
+            # Step 4: 分块发送
             logger.info("Step 4: Sending weight chunks...")
             t_transfer = time.perf_counter()
             chunks = self._chunk_handles(handles)
@@ -442,9 +448,11 @@ class IPCWeightTransfer:
                 )
             self._stats.transfer_time = time.perf_counter() - t_transfer
 
+            # Step 5: 完成权重更新
             logger.info("Step 5: Finishing weight update...")
             await self.client.finish_weight_update()
 
+            # Step 6: 唤醒vLLM
             logger.info("Step 6: Waking up vLLM...")
             await self.client.wake_up(tags=["weights", "kv_cache"])
 

@@ -28,6 +28,7 @@ from ..distributed import ParallelContext, ParallelTransformerModel, ZeROOptimiz
 from ..distributed.lora import apply_lora, merge_lora_weights, get_lora_state_dict
 from ..utils.logger import get_logger
 from ..utils.metrics import MetricsCollector
+from .icepop import IcePopConfig, IcePopFilter
 
 
 logger = get_logger("engines.train")
@@ -81,14 +82,17 @@ class TrainConfig:
     zero_stage: int = 1                 # ZeRO 阶段: 1=优化器分片, 2=优化器+梯度分片, 3=全分片
     # 通信-计算 overlap
     enable_comm_overlap: bool = False   # 当 tp_size > 1 时启用通信与计算重叠
-    # 原硬编码魔数配置化
+    # [P1-4] 原硬编码魔数配置化
     min_prompt_len: int = 16            # 序列截断时保留的最少prompt token数
-    min_advantage_scale: float = 0.01   # K=1退化时的minimum advantage
     # LR Scheduler
     lr_scheduler_type: str = "cosine"   # "cosine" / "linear" / "constant"
     warmup_steps: int = 100             # warmup 步数
     min_lr_ratio: float = 0.1           # 最终 lr = learning_rate * min_lr_ratio
     total_training_steps: int = 0       # 由外部传入（orchestrator 计算）
+    # IcePop 训推对齐检测
+    icepop_enabled: bool = False
+    icepop_divergence_threshold: float = 0.5
+    icepop_max_mask_ratio: float = 0.5
 
 
 @dataclass
@@ -124,10 +128,14 @@ class TrainEngine:
         self._accumulation_count = 0
         self.metrics_collector: Optional[MetricsCollector] = None
         self.lr_scheduler = None
-        self._old_log_probs_buffer: Optional[torch.Tensor] = None  # GRPO importance sampling buffer
+        self._old_log_probs_buffer: Optional[torch.Tensor] = None  # GRPO token-level importance sampling buffer [batch, seq_len]
         # Pipeline Parallel（pp_size>1 时在 initialize 中创建；否则保持 None，走现状路径）
         self.pp_context = None
         self.pipeline_scheduler = None
+        # IcePop 训推对齐检测（在 initialize 中根据配置创建）
+        self.icepop: Optional[IcePopFilter] = None
+        # SwiftSync 增量权重同步快照
+        self._prev_lora_snapshot: Optional[Dict[str, torch.Tensor]] = None
 
     def initialize(self, parallel_context: Optional[ParallelContext] = None):
         """初始化模型、LoRA、优化器
@@ -139,6 +147,7 @@ class TrainEngine:
         4. 创建ZeROOptimizer（仅优化LoRA参数）
         5. 配置AMP autocast
         """
+        # Step 1: 初始化ParallelContext
         if parallel_context is not None:
             self.parallel_ctx = parallel_context
         else:
@@ -149,6 +158,7 @@ class TrainEngine:
                 backend="nccl",
             )
 
+        # Step 1.5: Pipeline Parallel 前置约束校验（fail-fast，即使绕过 run_colocate 校验）
         # 本期 PP 仅支持 SFT + zero_stage<=1，且 num_micro_batches>=pp_size。
         if self.parallel_ctx.pp_size > 1:
             if self.config.zero_stage > 1:
@@ -168,6 +178,7 @@ class TrainEngine:
         self.pp_context = None
         self.pipeline_scheduler = None
 
+        # Step 2: 创建模型并加载权重
         model_config = self._load_model_config(self.config.model_path)
 
         # Pipeline Parallel: pp_size>1 时创建 stage 上下文 + 1F1B 调度器
@@ -242,6 +253,7 @@ class TrainEngine:
         else:
             logger.warning("CUDA is not visible to this process; training will run on CPU.")
 
+        # Step 2.5: 从tokenizer获取pad_token_id
         try:
             from transformers import AutoTokenizer
             tokenizer = AutoTokenizer.from_pretrained(self.config.model_path, trust_remote_code=True)
@@ -250,13 +262,42 @@ class TrainEngine:
         except Exception as e:
             logger.warning("Could not load pad_token_id from tokenizer, using default 0: %s", e)
 
-        # 深拷贝当前模型（apply LoRA之前的状态）作为参考策略
+        # Step 2.6: 创建ref_model（GRPO用于KL约束）
+        # 保存当前模型权重作为参考策略（避免 deepcopy 在分布式模式下因 ProcessGroup 不可 pickle 而失败）
         # ref_model不需要梯度，不注入LoRA
         if self.config.grpo_beta > 0:
-            import copy
-            self.ref_model = copy.deepcopy(self.model)
-            # deepcopy后显式绑定设备，防止跨设备计算错误
-            # 某些PyTorch版本/设备组合下deepcopy可能不保留device
+            try:
+                import copy
+                self.ref_model = copy.deepcopy(self.model)
+            except (TypeError, RuntimeError) as e:
+                # 分布式模式下 deepcopy 会失败（ProcessGroup 不可 pickle）
+                # 改用新建模型 + load_state_dict 方式重建 ref_model
+                logger.warning("deepcopy failed (%s), rebuilding ref_model via state_dict", type(e).__name__)
+                ref_state_dict = {k: v.detach().clone() for k, v in self.model.state_dict().items()}
+                self.ref_model = ParallelTransformerModel(
+                    vocab_size=model_config["vocab_size"],
+                    hidden_size=model_config["hidden_size"],
+                    num_layers=model_config["num_layers"],
+                    num_heads=model_config["num_heads"],
+                    num_kv_heads=model_config["num_kv_heads"],
+                    head_dim=model_config["head_dim"],
+                    intermediate_size=model_config["intermediate_size"],
+                    parallel_context=self.parallel_ctx,
+                    max_position_embeddings=model_config.get("max_position_embeddings", 32768),
+                    rms_norm_eps=model_config.get("rms_norm_eps", 1e-6),
+                    rope_theta=model_config.get("rope_theta", 1000000.0),
+                    tie_word_embeddings=model_config.get("tie_word_embeddings", False),
+                    use_flash_attn=self.config.use_flash_attn,
+                    attention_backend=self.config.attention_backend,
+                    use_gradient_checkpoint=False,
+                    enable_comm_overlap=False,
+                    stream_manager=None,
+                    pp_context=self.pp_context,
+                )
+                if torch.cuda.is_available():
+                    self.ref_model = self.ref_model.to(device)
+                self.ref_model.load_state_dict(ref_state_dict, strict=False)
+            # 确保在正确设备上
             if torch.cuda.is_available():
                 ref_device = next(self.model.parameters()).device
                 self.ref_model = self.ref_model.to(ref_device)
@@ -268,6 +309,7 @@ class TrainEngine:
         else:
             self.ref_model = None
 
+        # Step 3: 冻结原始参数，注入LoRA
         if self.config.lora_rank > 0:
             lora_config = {
                 "rank": self.config.lora_rank,
@@ -286,6 +328,7 @@ class TrainEngine:
         self._assert_single_device()
         self._log_device_state("after_lora")
 
+        # Step 3.5: 将冻结参数转为低精度以节省显存
         # autocast 只影响计算精度，不改变参数存储dtype；必须显式转换才能减少显存占用
         # LoRA 训练中 base model 冻结参数不参与梯度更新，可安全降精度存储
         # 全量 SFT (lora_rank=0) 时，所有参数都 requires_grad=True，也需要转精度以省显存
@@ -325,11 +368,15 @@ class TrainEngine:
                     param.data = param.data.to(cast_dtype)
                 logger.info("ref_model parameters also cast to %s", self.config.amp_dtype)
 
+        # Step 4: create optimizer for trainable LoRA parameters.
         # ZeRO作用域选择:
+        # - dp_size > 1: ZeRO 在 dp_group 上操作（梯度在 DP rank 间同步、分片）
+        # - dp_size <= 1: ZeRO 不分片（本地优化器、group=None、world_size=1），
         #   纯 TP 场景不再经 ZeRO 省显存
         # - 都是 1: 等价普通 AdamW
         trainable_params = [p for p in self.model.parameters() if p.requires_grad]
         if self.parallel_ctx.dp_size > 1 or self.parallel_ctx.tp_size > 1:
+            # 选择 ZeRO stage
             if self.config.zero_stage == 3:
                 self.optimizer = ZeROStage3Optimizer(
                     params=iter(trainable_params),
@@ -381,6 +428,7 @@ class TrainEngine:
             )
             logger.info("Optimizer initialized: AdamW (single-process local mode)")
 
+        # Step 4.5: LR Scheduler
         self.lr_scheduler = None
         if self.config.lr_scheduler_type != "constant" and self.config.total_training_steps > 0:
             from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
@@ -404,12 +452,14 @@ class TrainEngine:
             )
 
             if self.config.lr_scheduler_type == "cosine":
+                # Cosine decay
                 decay_scheduler = CosineAnnealingLR(
                     base_optimizer,
                     T_max=max(total_steps - warmup_steps, 1),
                     eta_min=self.config.learning_rate * self.config.min_lr_ratio,
                 )
             else:
+                # Linear decay
                 decay_scheduler = LinearLR(
                     base_optimizer,
                     start_factor=1.0,
@@ -417,6 +467,7 @@ class TrainEngine:
                     total_iters=max(total_steps - warmup_steps, 1),
                 )
 
+            # 组合 warmup + decay
             self.lr_scheduler = SequentialLR(
                 base_optimizer,
                 schedulers=[warmup_scheduler, decay_scheduler],
@@ -428,7 +479,8 @@ class TrainEngine:
                 self.config.learning_rate * self.config.min_lr_ratio,
             )
 
-        # ZeROOptimizer的ReduceScatter已处理梯度同步，
+        # Step 5: AMP 配置
+        # [P1-1根因修复] ZeROOptimizer的ReduceScatter已处理梯度同步，
         # GradScaler会与ZeRO的梯度管理冲突。采用autocast-only模式（无GradScaler）。
         # torch.amp.autocast 在新版 PyTorch 中必须显式指定 device_type。
         if self.config.amp_dtype == "fp32":
@@ -443,6 +495,22 @@ class TrainEngine:
             logger.info(f"AMP enabled: dtype={self.config.amp_dtype}")
         else:
             logger.info("AMP disabled (fp32 mode)")
+
+        # IcePop 初始化：根据配置创建过滤器实例
+        if self.config.icepop_enabled:
+            icepop_config = IcePopConfig(
+                enabled=True,
+                divergence_threshold=self.config.icepop_divergence_threshold,
+                max_mask_ratio=self.config.icepop_max_mask_ratio,
+                log_diagnostics=True,
+            )
+            self.icepop = IcePopFilter(icepop_config)
+            logger.info(
+                "IcePop enabled: threshold=%.3f, max_mask_ratio=%.2f",
+                icepop_config.divergence_threshold, icepop_config.max_mask_ratio,
+            )
+        else:
+            self.icepop = None
 
         self.model.train()
 
@@ -459,7 +527,7 @@ class TrainEngine:
         3. 如果prompt+response超长，截断prompt尾部
         """
         max_seq_len = self.config.max_seq_len
-        # min_prompt_len不应超过实际prompt长度，
+        # [P0-3根因修复] min_prompt_len不应超过实际prompt长度，
         # 否则当prompt本身<16时逻辑异常（截断后的prompt比原始prompt还长）
         min_prompt_len = min(self.config.min_prompt_len, len(prompt))
 
@@ -564,6 +632,10 @@ class TrainEngine:
         prompts_tokens: List[List[int]],
         responses_group: List[List[List[int]]],  # [batch, K, seq_len]
         rewards_group: List[List[float]],         # [batch, K]
+        infer_log_probs: Optional[torch.Tensor] = None,
+        skip_optimizer_step: bool = False,
+        reset_behavior_baseline: bool = True,
+        precomputed_advantages: Optional[List[List[float]]] = None,
     ) -> TrainMetrics:
         """GRPO训练步骤
 
@@ -587,6 +659,10 @@ class TrainEngine:
         assert not (self.pp_context is not None and self.pp_context.pp_size > 1), (
             "Pipeline Parallel (pp_size>1) 本期仅支持 SFT (sft_step)；GRPO 请使用 pp_size=1。"
         )
+        # [Fix] 重置 old_log_probs_buffer，确保每个新 batch 的 importance sampling 从 ratio=1 开始
+        if reset_behavior_baseline:
+            self._old_log_probs_buffer = None
+
         device = next(self.model.parameters()).device
         batch_size = len(prompts_tokens)
         num_samples = len(responses_group[0])  # K
@@ -605,20 +681,19 @@ class TrainEngine:
             rewards = rewards_group[i]
 
             # 计算组内相对优势 (Group Relative Advantage)
-            rewards_tensor = torch.tensor(rewards, dtype=torch.float32)
-            reward_mean = rewards_tensor.mean()
-            reward_std = rewards_tensor.std(unbiased=False)
-            # 避免除以0
-            if reward_std < 1e-8:
-                # K=1或所有reward相同时，使用绝对reward信号
-                # baseline设为0（假设reward范围是[-1, 1]）
-                advantages = rewards_tensor.clone()
-                # 如果所有advantage的绝对值都<epsilon，设为微小正值避免完全无梯度
-                # 使用配置化的min_advantage_scale
-                if advantages.abs().max() < 1e-8:
-                    advantages = torch.ones_like(rewards_tensor) * self.config.min_advantage_scale
+            if precomputed_advantages is not None:
+                # 使用外部预计算的 advantage（C3PO++ 分割前已计算）
+                advantages = torch.tensor(precomputed_advantages[i], dtype=torch.float32)
             else:
-                advantages = (rewards_tensor - reward_mean) / (reward_std + 1e-8)
+                rewards_tensor = torch.tensor(rewards, dtype=torch.float32)
+                reward_mean = rewards_tensor.mean()
+                reward_std = rewards_tensor.std(unbiased=False)
+                # 避免除以0
+                if reward_std < 1e-8:
+                    # 全组 reward 相同，没有相对信息可学，不更新策略
+                    advantages = torch.zeros_like(rewards_tensor)
+                else:
+                    advantages = (rewards_tensor - reward_mean) / (reward_std + 1e-8)
 
             for k in range(num_samples):
                 prompt_trunc, response = self._truncate_prompt_response(prompt, responses_group[i][k])
@@ -652,37 +727,69 @@ class TrainEngine:
         # 计算log_probs
         if self._amp_enabled:
             with autocast(device_type=device.type, dtype=self._amp_dtype):
-                log_probs = self._compute_log_probs(input_ids_tensor, labels_tensor)
-                # 计算ref_log_probs（用于KL约束）
+                token_log_probs, mask = self._compute_log_probs(input_ids_tensor, labels_tensor)
+                # === IcePop: 训推对齐检测（零额外 forward 路径） ===
+                if self.icepop is not None and self.icepop.config.enabled:
+                    # IcePop 需要 sequence-level log_probs
+                    seq_log_probs = self._aggregate_token_log_probs(token_log_probs, mask)
+                    if infer_log_probs is not None:
+                        advantages_tensor, icepop_info = self.icepop.filter_divergent_responses(
+                            seq_log_probs.detach(), infer_log_probs.detach(), advantages_tensor
+                        )
+                    else:
+                        with torch.no_grad():
+                            fallback_infer_lp = self._compute_inference_log_probs(input_ids_tensor, labels_tensor)
+                        advantages_tensor, icepop_info = self.icepop.filter_divergent_responses(
+                            seq_log_probs.detach(), fallback_infer_lp, advantages_tensor
+                        )
+                # 计算ref_token_log_probs（用于KL约束）
                 with torch.no_grad():
                     if self.ref_model is not None:
-                        ref_log_probs = self._compute_log_probs_with_model(self.ref_model, input_ids_tensor, labels_tensor)
+                        ref_token_log_probs, _ = self._compute_log_probs_with_model(self.ref_model, input_ids_tensor, labels_tensor)
                     else:
-                        ref_log_probs = None
+                        ref_token_log_probs = None
+                # 获取 old_token_log_probs (首次迭代用当前值，即 ratio=1，退化为标准 PG)
                 if self._old_log_probs_buffer is None:
-                    old_log_probs = log_probs.detach()
+                    old_token_log_probs = token_log_probs.detach()
                 else:
-                    old_log_probs = self._old_log_probs_buffer
-                loss, loss_info = self._compute_grpo_loss(log_probs, advantages_tensor, old_log_probs, ref_log_probs)
+                    old_token_log_probs = self._old_log_probs_buffer
+                loss, loss_info = self._compute_grpo_loss(token_log_probs, old_token_log_probs, mask, advantages_tensor, ref_token_log_probs)
         else:
-            log_probs = self._compute_log_probs(input_ids_tensor, labels_tensor)
-            # 计算ref_log_probs（用于KL约束）
+            token_log_probs, mask = self._compute_log_probs(input_ids_tensor, labels_tensor)
+            # === IcePop: 训推对齐检测（零额外 forward 路径） ===
+            if self.icepop is not None and self.icepop.config.enabled:
+                # IcePop 需要 sequence-level log_probs
+                seq_log_probs = self._aggregate_token_log_probs(token_log_probs, mask)
+                if infer_log_probs is not None:
+                    advantages_tensor, icepop_info = self.icepop.filter_divergent_responses(
+                        seq_log_probs.detach(), infer_log_probs.detach(), advantages_tensor
+                    )
+                else:
+                    with torch.no_grad():
+                        fallback_infer_lp = self._compute_inference_log_probs(input_ids_tensor, labels_tensor)
+                    advantages_tensor, icepop_info = self.icepop.filter_divergent_responses(
+                        seq_log_probs.detach(), fallback_infer_lp, advantages_tensor
+                    )
+            # 计算ref_token_log_probs（用于KL约束）
             with torch.no_grad():
                 if self.ref_model is not None:
-                    ref_log_probs = self._compute_log_probs_with_model(self.ref_model, input_ids_tensor, labels_tensor)
+                    ref_token_log_probs, _ = self._compute_log_probs_with_model(self.ref_model, input_ids_tensor, labels_tensor)
                 else:
-                    ref_log_probs = None
+                    ref_token_log_probs = None
+            # 获取 old_token_log_probs (首次迭代用当前值，即 ratio=1，退化为标准 PG)
             if self._old_log_probs_buffer is None:
-                old_log_probs = log_probs.detach()
+                old_token_log_probs = token_log_probs.detach()
             else:
-                old_log_probs = self._old_log_probs_buffer
-            loss, loss_info = self._compute_grpo_loss(log_probs, advantages_tensor, old_log_probs, ref_log_probs)
+                old_token_log_probs = self._old_log_probs_buffer
+            loss, loss_info = self._compute_grpo_loss(token_log_probs, old_token_log_probs, mask, advantages_tensor, ref_token_log_probs)
 
-        self._old_log_probs_buffer = log_probs.detach().clone()
+        # 更新 old_log_probs buffer (在 backward 之前 detach + clone，阻断梯度)
+        self._old_log_probs_buffer = token_log_probs.detach().clone()
 
+        # 梯度累积
         scaled_loss = loss / self.config.gradient_accumulation_steps
 
-        # autocast-only模式：无需scaler.scale()，直接backward
+        # [P1-1] autocast-only模式：无需scaler.scale()，直接backward
         scaled_loss.backward()
 
         # ZeRO-3: backward 后释放完整参数
@@ -693,13 +800,15 @@ class TrainEngine:
 
         # 累积满gradient_accumulation_steps步后执行优化器更新
         grad_norm = 0.0
-        if self._accumulation_count >= self.config.gradient_accumulation_steps:
-            # autocast-only模式：不再有GradScaler分支
+        if self._accumulation_count >= self.config.gradient_accumulation_steps and not skip_optimizer_step:
+            # [P1-1] autocast-only模式：不再有GradScaler分支
+            # 梯度裁剪：ZeRO-2/3 使用专用接口（p.grad 已被清空）
             if isinstance(self.optimizer, (ZeROStage2Optimizer, ZeROStage3Optimizer)):
                 grad_norm = self.optimizer.clip_grad_norm(self.config.max_grad_norm)
             else:
                 grad_norm = self._clip_grad_norm()
             if grad_norm < 0:
+                # 梯度异常（NaN/Inf），跳过optimizer更新
                 logger.warning("Skipping optimizer step due to gradient anomaly")
                 self.optimizer.zero_grad()
                 self._accumulation_count = 0
@@ -713,7 +822,7 @@ class TrainEngine:
                 self.step_count += 1  # 仅在真正更新权重时递增
                 # 显存水位监控
                 if self.step_count % 10 == 0 and torch.cuda.is_available():
-                    peak_mem = torch.cuda.max_memory_allocated() / 1e9
+                    peak_mem = torch.cuda.max_memory_reserved() / 1e9
                     logger.info("[Step %d] peak_memory=%.2fGB", self.step_count, peak_mem)
                     if self.metrics_collector is not None:
                         self.metrics_collector.record("peak_memory_gb", peak_mem)
@@ -963,7 +1072,11 @@ class TrainEngine:
         temperature: float = 0.7,
         top_p: float = 0.95,
     ) -> torch.Tensor:
-        """从最后一步 logits 中采样一个 token。"""
+        """从最后一步 logits 中采样一个 token。
+
+        TP 多卡场景下，仅在 rank 0 执行 multinomial 采样，
+        然后 broadcast 到 TP group 内所有 rank，确保采样一致性。
+        """
         if temperature <= 0:
             return torch.argmax(logits, dim=-1)
 
@@ -984,48 +1097,56 @@ class TrainEngine:
             logits = filtered_logits
 
         probs = torch.softmax(logits, dim=-1)
-        return torch.multinomial(probs, num_samples=1).squeeze(-1)
+
+        # TP 采样同步：仅在 TP rank 0 执行 multinomial，然后 broadcast 到组内
+        if self.parallel_ctx and self.parallel_ctx.tp_size > 1:
+            import torch.distributed as dist
+            device = logits.device
+            batch_size = probs.shape[0] if probs.dim() > 1 else 1
+            tp_group = self.parallel_ctx.tp_group
+            if self.parallel_ctx.tp_rank == 0:
+                next_token = torch.multinomial(probs, num_samples=1).squeeze(-1)
+            else:
+                next_token = torch.empty(batch_size, dtype=torch.long, device=device)
+            # 正确计算当前 TP group 内 rank0 的 global rank（dp_size>1 时不一定是 global 0）
+            group_ranks = dist.get_process_group_ranks(tp_group)
+            src_global = group_ranks[0]
+            dist.broadcast(next_token, src=src_global, group=tp_group)
+            return next_token
+        else:
+            return torch.multinomial(probs, num_samples=1).squeeze(-1)
 
     def _compute_log_probs(
         self, input_ids: torch.Tensor, labels: torch.Tensor
-    ) -> torch.Tensor:
-        """计算模型对给定序列的log概率
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """计算模型对给定序列的逐 token log概率
 
-        input_ids: [batch, seq_len]
-        labels: [batch, seq_len] (prompt部分mask为-100)
+        Args:
+            input_ids: [batch, seq_len]
+            labels: [batch, seq_len] (prompt部分mask为-100)
 
-        return: [batch] 每个样本的平均log_prob
+        Returns:
+            token_log_probs: [batch, seq_len-1] 每个位置的 log_prob（padding 位置为 0）
+            mask: [batch, seq_len-1] 有效 token 的 mask（labels != -100）
         """
-        # 前向推理获取logits
         logits = self.model(input_ids)  # [batch, seq_len, vocab_size]
+        shift_logits = logits[:, :-1, :].contiguous()
+        shift_labels = labels[:, 1:].contiguous()
 
-        # Shift: logits[:-1] 对应 labels[1:]
-        shift_logits = logits[:, :-1, :].contiguous()  # [batch, seq_len-1, vocab]
-        shift_labels = labels[:, 1:].contiguous()       # [batch, seq_len-1]
-
-        # 计算每个token的log_prob
-        log_probs_all = F.log_softmax(shift_logits, dim=-1)  # [batch, seq_len-1, vocab]
-
-        # 收集每个位置真实token的log_prob
-        # [batch, seq_len-1]
+        log_probs_all = F.log_softmax(shift_logits, dim=-1)
         token_log_probs = log_probs_all.gather(
             dim=-1, index=shift_labels.clamp(min=0).unsqueeze(-1)
         ).squeeze(-1)
 
-        # 创建mask：labels != -100 的位置才计算
-        mask = (shift_labels != -100).float()  # [batch, seq_len-1]
-
-        # 对mask后的token_log_probs求平均
-        # 每个样本的平均log_prob
+        mask = (shift_labels != -100).float()
         token_log_probs = token_log_probs * mask
-        seq_log_probs = token_log_probs.sum(dim=-1) / (mask.sum(dim=-1) + 1e-8)  # [batch]
 
-        return seq_log_probs
+        return token_log_probs, mask
 
     def _compute_log_probs_with_model(
         self, model: 'ParallelTransformerModel', input_ids: torch.Tensor, labels: torch.Tensor
-    ) -> torch.Tensor:
-        """使用指定模型计算log概率（复用log_prob逻辑，用于ref_model）
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """使用指定模型计算逐 token log概率（复用log_prob逻辑，用于ref_model）
 
         Args:
             model: 用于计算的模型（如ref_model）
@@ -1033,7 +1154,8 @@ class TrainEngine:
             labels: [batch, seq_len] (prompt部分mask为-100)
 
         Returns:
-            [batch] 每个样本的平均log_prob
+            token_log_probs: [batch, seq_len-1] 每个位置的 log_prob（padding 位置为 0）
+            mask: [batch, seq_len-1] 有效 token 的 mask（labels != -100）
         """
         logits = model(input_ids)  # [batch, seq_len, vocab_size]
 
@@ -1048,9 +1170,69 @@ class TrainEngine:
 
         mask = (shift_labels != -100).float()
         token_log_probs = token_log_probs * mask
-        seq_log_probs = token_log_probs.sum(dim=-1) / (mask.sum(dim=-1) + 1e-8)
 
-        return seq_log_probs
+        return token_log_probs, mask
+
+    def _compute_inference_log_probs(
+        self, input_ids: torch.Tensor, labels: torch.Tensor
+    ) -> torch.Tensor:
+        """以推理模式计算 log_probs（模拟推理引擎前向路径）
+
+        在自研引擎中训推共享模型，主要差异在采样随机性而非前向计算。
+        此方法以 model.eval() + torch.no_grad() 模式执行前向，
+        模拟推理引擎的确定性前向路径（无 dropout 等训练专属行为）。
+
+        Args:
+            input_ids: [batch*K, seq_len]
+            labels: [batch*K, seq_len] (prompt部分mask为-100)
+
+        Returns:
+            [batch*K] 序列级 log_probs
+        """
+        was_training = self.model.training
+        self.model.eval()
+
+        try:
+            device = next(self.model.parameters()).device
+            if self._amp_enabled:
+                with autocast(device_type=device.type, dtype=self._amp_dtype):
+                    logits = self.model(input_ids)
+            else:
+                logits = self.model(input_ids)
+
+            # Shift: logits[:-1] 对应 labels[1:]
+            shift_logits = logits[:, :-1, :].contiguous()
+            shift_labels = labels[:, 1:].contiguous()
+
+            log_probs_all = F.log_softmax(shift_logits, dim=-1)
+
+            token_log_probs = log_probs_all.gather(
+                dim=-1, index=shift_labels.clamp(min=0).unsqueeze(-1)
+            ).squeeze(-1)
+
+            mask = (shift_labels != -100).float()
+            token_log_probs = token_log_probs * mask
+            seq_log_probs = token_log_probs.sum(dim=-1) / (mask.sum(dim=-1) + 1e-8)
+
+            return seq_log_probs
+        finally:
+            # 恢复原始训练模式
+            if was_training:
+                self.model.train()
+
+    def _aggregate_token_log_probs(
+        self, token_log_probs: torch.Tensor, mask: torch.Tensor
+    ) -> torch.Tensor:
+        """将 token-level log_probs 聚合为 sequence-level（供 IcePop 等模块使用）
+
+        Args:
+            token_log_probs: [batch, seq_len] 逐 token log_probs（padding 位置已为 0）
+            mask: [batch, seq_len] 有效 token mask
+
+        Returns:
+            [batch] 每个样本的平均 log_prob
+        """
+        return (token_log_probs * mask).sum(dim=-1) / (mask.sum(dim=-1) + 1e-8)
 
     def _single_batch_step(self, input_ids_tensor: torch.Tensor, labels_tensor: torch.Tensor):
         """单批 SFT 训练步（pp_size==1 路径，与重构前逻辑 bit 级一致）。
@@ -1080,11 +1262,13 @@ class TrainEngine:
         self._accumulation_count += 1
         grad_norm = 0.0
         if self._accumulation_count >= self.config.gradient_accumulation_steps:
+            # 梯度裁剪：ZeRO-2/3 使用专用接口（p.grad 已被清空）
             if isinstance(self.optimizer, (ZeROStage2Optimizer, ZeROStage3Optimizer)):
                 grad_norm = self.optimizer.clip_grad_norm(self.config.max_grad_norm)
             else:
                 grad_norm = self._clip_grad_norm()
             if grad_norm < 0:
+                # 梯度异常（NaN/Inf），跳过optimizer更新
                 logger.warning("Skipping optimizer step due to gradient anomaly")
                 self.optimizer.zero_grad()
                 self._accumulation_count = 0
@@ -1098,7 +1282,7 @@ class TrainEngine:
                 self.step_count += 1  # 仅在真正更新权重时递增
                 # 显存水位监控
                 if self.step_count % 10 == 0 and torch.cuda.is_available():
-                    peak_mem = torch.cuda.max_memory_allocated() / 1e9
+                    peak_mem = torch.cuda.max_memory_reserved() / 1e9
                     logger.info("[Step %d] peak_memory=%.2fGB", self.step_count, peak_mem)
                     if self.metrics_collector is not None:
                         self.metrics_collector.record("peak_memory_gb", peak_mem)
@@ -1124,7 +1308,7 @@ class TrainEngine:
             f"batch_size={input_ids_tensor.shape[0]} 无法均分为 {num_micro} 份 micro-batch"
             f"（得 {len(micro_inputs)} 份）；请保证 per-DP batch 能被 num_micro_batches 整除"
         )
-        # torch.chunk 不整除时最后一块更短且上面 len 断言恒真，无法发现非均分。
+        # [FIX-C] torch.chunk 不整除时最后一块更短且上面 len 断言恒真，无法发现非均分。
         # 显式校验各 micro-batch 大小一致，保证 1F1B 数学等价（各微批 loss 等权平均）前提成立。
         batch_sizes = {mb.shape[0] for mb in micro_inputs}
         if len(batch_sizes) != 1:
@@ -1159,7 +1343,7 @@ class TrainEngine:
             self.optimizer.zero_grad()
             self.step_count += 1
             if self.step_count % 10 == 0 and torch.cuda.is_available():
-                peak_mem = torch.cuda.max_memory_allocated() / 1e9
+                peak_mem = torch.cuda.max_memory_reserved() / 1e9
                 logger.info("[Step %d][PP] peak_memory=%.2fGB", self.step_count, peak_mem)
                 if self.metrics_collector is not None:
                     self.metrics_collector.record("peak_memory_gb", peak_mem)
@@ -1202,64 +1386,64 @@ class TrainEngine:
 
     def _compute_grpo_loss(
         self,
-        log_probs: torch.Tensor,
-        advantages: torch.Tensor,
-        old_log_probs: torch.Tensor,
-        ref_log_probs: Optional[torch.Tensor] = None,
+        token_log_probs: torch.Tensor,      # [batch, seq_len]
+        old_token_log_probs: torch.Tensor,   # [batch, seq_len]
+        mask: torch.Tensor,                  # [batch, seq_len]
+        advantages: torch.Tensor,            # [batch] — per-response advantage
+        ref_token_log_probs: Optional[torch.Tensor] = None,  # [batch, seq_len]
     ) -> Tuple[torch.Tensor, dict]:
-        """完整 GRPO Loss = PPO Clipping + KL Regularization
+        """完整 GRPO Loss = PPO Clipping + KL Regularization (token-level)
 
         Args:
-            log_probs: [batch*K] 当前策略的 log probabilities (requires_grad)
-            advantages: [batch*K] 组内相对优势 (detached)
-            old_log_probs: [batch*K] 上一轮策略的 log probabilities (detached, 用于 importance sampling)
-            ref_log_probs: [batch*K] 参考策略的 log probabilities (detached, 用于 KL penalty)
+            token_log_probs: [batch, seq_len] 当前策略的逐 token log probs (requires_grad)
+            old_token_log_probs: [batch, seq_len] 上一轮策略的逐 token log probs (detached)
+            mask: [batch, seq_len] 有效 token mask
+            advantages: [batch] 组内相对优势 (detached)
+            ref_token_log_probs: [batch, seq_len] 参考策略的逐 token log probs (detached)
 
         Returns:
             loss: 标量loss
             info: 包含诊断信息的字典
         """
-        ratio = torch.exp(log_probs - old_log_probs.detach())
+        # Token-level ratio
+        ratio = torch.exp(token_log_probs - old_token_log_probs.detach())  # [batch, seq_len]
 
-        # 安全监控: ratio 异常时输出警告
-        with torch.no_grad():
-            ratio_max = ratio.max().item()
-            ratio_min = ratio.min().item()
-            if ratio_max > 10.0 or ratio_min < 0.1:
-                logger.warning(
-                    "GRPO ratio out of safe range: min=%.4f, max=%.4f (safe=[0.1, 10.0])",
-                    ratio_min, ratio_max,
-                )
+        # Advantage broadcast: [batch] → [batch, 1]
+        advantages_expanded = advantages.unsqueeze(-1)  # [batch, 1]
 
-        surr1 = ratio * advantages
+        # PPO-style clipping (per token)
+        surr1 = ratio * advantages_expanded  # [batch, seq_len]
         surr2 = torch.clamp(
             ratio,
             1.0 - self.config.grpo_clip_eps,
             1.0 + self.config.grpo_clip_eps,
-        ) * advantages
-        policy_loss = -torch.min(surr1, surr2).mean()
+        ) * advantages_expanded
 
-        kl_div = torch.tensor(0.0, device=log_probs.device)
-        if ref_log_probs is not None and self.config.grpo_beta > 0:
-            # KL(policy || ref) = E[log(policy) - log(ref)]
-            kl_div = (log_probs - ref_log_probs).mean()
-            # KL应该是非负的，但由于估计误差可能为负，clamp到0
-            kl_div = kl_div.clamp(min=0.0)
+        # Masked loss: sum over valid tokens / total valid count
+        token_loss = -torch.min(surr1, surr2) * mask
+        policy_loss = token_loss.sum() / (mask.sum() + 1e-8)
+
+        # Token-level KL
+        kl_div = torch.tensor(0.0, device=token_log_probs.device)
+        if ref_token_log_probs is not None and self.config.grpo_beta > 0:
+            kl_per_token = (token_log_probs - ref_token_log_probs.detach()) * mask
+            kl_div = (kl_per_token.sum() / (mask.sum() + 1e-8)).clamp(min=0.0)
 
         # Total loss
         loss = policy_loss + self.config.grpo_beta * kl_div
 
         # 诊断信息
         with torch.no_grad():
+            valid_ratio = (ratio * mask)
+            valid_count = mask.sum()
             info = {
                 "policy_loss": policy_loss.item(),
                 "kl_divergence": kl_div.item(),
-                "ratio_mean": ratio.mean().item(),
-                "ratio_max": ratio_max,
-                "ratio_min": ratio_min,
-                "clipped_fraction": (
-                    (ratio - 1.0).abs() > self.config.grpo_clip_eps
-                ).float().mean().item(),
+                "ratio_mean": (valid_ratio.sum() / (valid_count + 1e-8)).item(),
+                "ratio_max": ratio[mask.bool()].max().item() if mask.any() else 1.0,
+                "ratio_min": ratio[mask.bool()].min().item() if mask.any() else 1.0,
+                "clipped_fraction": ((ratio - 1.0).abs() > self.config.grpo_clip_eps).float()[mask.bool()].mean().item() if mask.any() else 0.0,
+                "valid_token_count": int(valid_count.item()),
             }
 
         return loss, info
@@ -1267,7 +1451,7 @@ class TrainEngine:
     def _clip_grad_norm(self) -> float:
         """裁剪梯度范数
 
-        多卡TP场景下，各rank持有不同的参数分片，
+        [P0-1根因修复] 多卡TP场景下，各rank持有不同的参数分片，
         梯度范数应为全局范数而非local范数。
         解决方案：计算local范数后AllReduce聚合为全局范数再clip。
         单卡时(world_size=1)退化为标准clip_grad_norm。
@@ -1302,9 +1486,13 @@ class TrainEngine:
         total_norm_sq = torch.tensor(total_norm_sq, device=next(iter(trainable_params)).device)
 
         # 多卡时AllReduce梯度范数平方和
-        # 3D 全局范数：对存在的每个并行组各自独立 AllReduce 平方范数和。
+        # [FIX-A] 3D 全局范数：对存在的每个并行组各自独立 AllReduce 平方范数和。
         # 旧实现用 norm_group = dp_group if dp>1 else tp_group 做"二选一"，当 dp>1 且 tp>1 时
         # 会漏掉 TP 维度导致全局范数低估、裁剪偏弱。改为逐组累加：
+        #   - tp-only(tp>1,dp=1): 仅 tp 归约（行为不变）
+        #   - dp-only(dp>1,tp=1): 仅 dp 归约（行为不变）
+        #   - dp>1 且 tp>1:       dp + tp 均归约（修复）
+        #   - pp>1:               额外 pp 归约（参数分布在各 stage）
         if self.parallel_ctx is not None and self.parallel_ctx.world_size > 1:
             import torch.distributed as dist
             t0 = time.perf_counter()
@@ -1368,6 +1556,28 @@ class TrainEngine:
 
         self.model.train()
         return result
+
+    def export_lora_delta(self, device: str = "cuda") -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+        """导出 LoRA 参数增量（SwiftSync 用）
+
+        Returns:
+            (delta_dict, current_lora_state)
+            - delta_dict: 当前 LoRA 与上次快照的差值（首次返回完整参数）
+            - current_lora_state: 当前完整 LoRA 参数
+        """
+        current = get_lora_state_dict(self.model)
+
+        if self._prev_lora_snapshot is None:
+            # 首次同步：返回完整 LoRA 参数作为初始化
+            delta = {k: v.detach().to(device) for k, v in current.items()}
+        else:
+            # 增量：当前 - 上次快照
+            delta = {k: (v - self._prev_lora_snapshot[k]).detach().to(device)
+                     for k, v in current.items()}
+
+        # 更新快照
+        self._prev_lora_snapshot = {k: v.detach().clone() for k, v in current.items()}
+        return delta, {k: v.detach() for k, v in current.items()}
 
     def save_checkpoint(self, path: str):
         """保存训练检查点（仅LoRA参数 + optimizer state）"""
@@ -1533,7 +1743,7 @@ class TrainEngine:
             if torch.cuda.is_available():
                 device = next(self.model.parameters()).device
                 report["peak_moments"] = {
-                    "overall_peak_gb": torch.cuda.max_memory_allocated(device) / 1e9,
+                    "overall_peak_gb": torch.cuda.max_memory_reserved(device) / 1e9,
                     "current_allocated_gb": torch.cuda.memory_allocated(device) / 1e9,
                     "current_reserved_gb": torch.cuda.memory_reserved(device) / 1e9,
                 }

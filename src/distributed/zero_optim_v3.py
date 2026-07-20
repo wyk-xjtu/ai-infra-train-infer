@@ -114,6 +114,7 @@ class ZeROStage3Optimizer:
         self._param_shapes = [p.shape for p in self.params]
         self._param_numels = [p.numel() for p in self.params]
 
+        # Step 1: 创建平坦化的参数 buffer（所有 rank 一致）
         # 对齐到 world_size 的整数倍（padding）
         self.padded_size = self._pad_to_divisible(self.param_count, self.world_size)
         self._buffer_dtype = self.params[0].dtype  # 跟随模型参数 dtype（bf16）
@@ -127,17 +128,21 @@ class ZeROStage3Optimizer:
             flat_full[offset:offset + numel].copy_(p.data.view(-1).to(self._buffer_dtype))
             offset += numel
 
+        # Step 2: 计算每个 rank 负责的分片范围
         self.shard_size = self.padded_size // self.world_size
         self.shard_start = self.rank * self.shard_size
         self.shard_end = self.shard_start + self.shard_size
 
+        # Step 3: 只保留本 rank 的参数 shard（bf16，用于通信）
         # 这是 ZeRO-3 的核心：每卡只常驻 1/N 的参数
         self.flat_param_shard = flat_full[self.shard_start:self.shard_end].clone()
 
+        # Step 4: 为本地分片创建 optimizer
         # local_shard 使用 fp32（AdamW master weights 需要高精度）
         self.local_shard = self.flat_param_shard.clone().detach().float().requires_grad_(True)
         self.local_optimizer = optimizer_class([self.local_shard], **optimizer_kwargs)
 
+        # Step 5: 梯度累加器（fp32，支持 gradient accumulation）
         self._local_grad_acc = torch.zeros(
             self.shard_size, dtype=torch.float32, device=self._device
         )
@@ -146,9 +151,11 @@ class ZeROStage3Optimizer:
         self._params_gathered = False  # 当前模型是否持有完整参数
         self._grad_hooks = []
 
+        # Step 6: 注册梯度 hook（backward 完成后自动 ReduceScatter）
         self._grad_count = 0
         self._register_grad_hooks()
 
+        # Step 7: 释放模型中的完整参数，只保留空壳
         # 初始状态下模型参数被释放，只有 forward 前 AllGather 才恢复
         self._release_full_params()
 
@@ -367,13 +374,16 @@ class ZeROStage3Optimizer:
         
         注意：不需要 AllGather 全量参数（下次 forward 时按需 gather）
         """
+        # Step 1: 将累积的梯度 shard 赋给 local_shard 并更新
         if self.local_shard.grad is None:
             self.local_shard.grad = torch.zeros_like(self.local_shard)
         self.local_shard.grad.copy_(self._local_grad_acc)  # fp32 → fp32 in-place
         self.local_optimizer.step()
 
+        # Step 2: 将更新后的 local shard (fp32) 写回 flat_param_shard (bf16)
         self.flat_param_shard.copy_(self.local_shard.data.to(self._buffer_dtype))
 
+        # Step 3: 清零梯度累加器，为下一轮准备
         self._local_grad_acc.zero_()
 
     def zero_grad(self):
@@ -405,18 +415,22 @@ class ZeROStage3Optimizer:
                            self._grad_count, len(self.params))
             self._reduce_scatter_grads()
 
+        # 1. NaN/Inf 检测
         if torch.isnan(self._local_grad_acc).any() or torch.isinf(self._local_grad_acc).any():
             logger.warning("NaN/Inf detected in ZeRO-3 local gradients")
             return -1.0
 
+        # 2. 计算本 rank 的局部梯度范数平方
         local_norm_sq = self._local_grad_acc.float().norm(2).item() ** 2
         total_norm_sq = torch.tensor(local_norm_sq, device=self._device)
 
+        # 3. AllReduce 聚合全局范数（所有 rank 的 shard 范数之和 = 全局范数）
         if self.world_size > 1 and self.group is not None:
             dist.all_reduce(total_norm_sq, op=dist.ReduceOp.SUM, group=self.group)
 
         total_norm = total_norm_sq.sqrt().item()
 
+        # 4. 裁剪
         clip_coef = max_norm / (total_norm + 1e-6)
         if clip_coef < 1.0:
             self._local_grad_acc.mul_(clip_coef)

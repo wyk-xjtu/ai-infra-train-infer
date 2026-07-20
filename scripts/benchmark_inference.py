@@ -36,6 +36,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("benchmark_inference")
 
+# ─────────────────────── 测试 Prompt 生成 ───────────────────────
 
 FIXED_PROMPTS = [
     "What is 2+2? Answer with a single number.",
@@ -86,6 +87,8 @@ def generate_prompts_tokens(
         ]
 
 
+# ─────────────────────── 计时工具 ───────────────────────
+
 class GPUTimer:
     """使用 torch.cuda.Event 精确计时，避免 CPU-GPU 同步开销干扰"""
 
@@ -110,6 +113,8 @@ class GPUTimer:
             return (time.perf_counter() - self._cpu_start) * 1000.0
 
 
+# ─────────────────────── 单模式 Benchmark ───────────────────────
+
 def benchmark_single_mode(
     mode: str,
     model_path: str,
@@ -132,6 +137,7 @@ def benchmark_single_mode(
     logger.info("Benchmark mode: %s", mode)
     logger.info("=" * 60)
 
+    # ─── 构建 InferenceConfig ───
     config_kwargs = {
         "inference_mode": mode,
         "model_path": model_path if mode != "mock" else "",
@@ -161,13 +167,16 @@ def benchmark_single_mode(
 
     config = InferenceConfig(**config_kwargs)
 
+    # ─── 初始化引擎 ───
     logger.info("Initializing InferenceEngine (mode=%s)...", mode)
     engine = InferenceEngine(config)
     engine.initialize()
     logger.info("Engine initialized successfully.")
 
+    # 获取 tokenizer（如果引擎加载了模型）
     tokenizer = getattr(engine, "_tokenizer", None)
 
+    # ─── 生成测试 prompts ───
     prompts_tokens = generate_prompts_tokens(num_prompts, tokenizer)
     logger.info(
         "Generated %d prompts (avg length: %.1f tokens)",
@@ -175,6 +184,7 @@ def benchmark_single_mode(
         sum(len(p) for p in prompts_tokens) / len(prompts_tokens),
     )
 
+    # ─── Warmup ───
     logger.info("Warmup: %d runs...", warmup)
     for w in range(warmup):
         # 按 batch_size 分批
@@ -182,6 +192,7 @@ def benchmark_single_mode(
         _ = engine.generate(batch, max_tokens=min(max_tokens, 16), temperature=0.0)
         logger.info("  Warmup %d/%d done", w + 1, warmup)
 
+    # ─── 正式测量 ───
     logger.info("Benchmarking: %d runs x %d prompts (batch_size=%d)...", num_runs, num_prompts, batch_size)
 
     if use_cuda:
@@ -193,6 +204,7 @@ def benchmark_single_mode(
     all_tokens_generated = []
 
     for run_idx in range(num_runs):
+        # 分 batch 处理
         run_total_tokens = 0
         run_total_ms = 0.0
         run_prefill_ms_list = []
@@ -204,11 +216,13 @@ def benchmark_single_mode(
 
             # 测量 prefill (第一个 token 的生成时间)
             # 由于 engine.generate 是端到端接口，我们分两步测量：
+            # Step 1: 生成 1 个 token 测 prefill
             timer.start()
             result_prefill = engine.generate(batch, max_tokens=1, temperature=0.0)
             prefill_ms = timer.stop()
             run_prefill_ms_list.append(prefill_ms)
 
+            # Step 2: 生成完整序列测总时间
             timer.start()
             results = engine.generate(batch, max_tokens=max_tokens, temperature=0.0)
             total_batch_ms = timer.stop()
@@ -222,6 +236,7 @@ def benchmark_single_mode(
             run_total_tokens += batch_tokens
             run_total_ms += total_batch_ms
 
+            # Decode 延迟 = (总时间 - prefill) / (tokens - batch_size)
             # 注意：这里用近似方法，因为完整生成包含 prefill
             decode_tokens = max(batch_tokens - len(batch), 1)
             decode_ms = max(total_batch_ms - prefill_ms, 0.0)
@@ -243,6 +258,7 @@ def benchmark_single_mode(
             run_total_tokens, run_total_ms,
         )
 
+    # ─── 汇总统计 ───
     avg_prefill = sum(all_prefill_ms) / len(all_prefill_ms)
     avg_decode = sum(all_decode_ms_per_token) / len(all_decode_ms_per_token)
     total_time_sec = sum(all_total_ms) / 1000.0
@@ -272,6 +288,7 @@ def benchmark_single_mode(
         },
     }
 
+    # 输出结果
     logger.info("-" * 60)
     logger.info("Results for mode=%s:", mode)
     logger.info("  Prefill latency:    %.2f ms", avg_prefill)
@@ -284,6 +301,8 @@ def benchmark_single_mode(
 
     return result
 
+
+# ─────────────────────── 对比模式 ───────────────────────
 
 def benchmark_all_modes(
     model_path: str,
@@ -321,6 +340,7 @@ def benchmark_all_modes(
         )
         results.append(result)
 
+    # ─── 输出对比表格 ───
     print("\n")
     print("=" * 80)
     print("  INFERENCE BENCHMARK COMPARISON")
@@ -355,6 +375,8 @@ def benchmark_all_modes(
     print("=" * 80)
     return results
 
+
+# ─────────────────────── 主入口 ───────────────────────
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -444,6 +466,7 @@ def main():
         )
         results = [result]
 
+    # 输出 JSON
     if args.output_json:
         output_dir = os.path.dirname(args.output_json)
         if output_dir:

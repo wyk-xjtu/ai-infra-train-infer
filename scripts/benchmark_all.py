@@ -213,9 +213,11 @@ async def main():
         },
     }
 
+    # 1. 运行Colocate benchmark
     colocate_results = await run_colocate_benchmark(args, logger)
     results["colocate"] = colocate_results
 
+    # 2. 运行Disaggregated benchmark (除非quick模式)
     if not args.quick:
         disagg_results = await run_disagg_benchmark(args, logger)
         results["disaggregated"] = disagg_results
@@ -223,9 +225,11 @@ async def main():
         disagg_results = {"status": "skipped", "reason": "quick mode"}
         results["disaggregated"] = disagg_results
 
+    # 3. 对比输出
     if colocate_results.get("status") != "failed" and disagg_results.get("status") not in ("failed", "skipped"):
         print_comparison(colocate_results, disagg_results, logger)
 
+    # 4. 保存结果到JSON文件
     with open(output_file, "w", encoding="utf-8") as f:
         json.dump(results, f, indent=2, ensure_ascii=False, default=str)
     logger.info(f"\nResults saved to: {output_file}")

@@ -1,0 +1,96 @@
+# Ablation C: 仅 C3PO++（动态分割打包对显存和训练步时间的影响）
+# 对比指标：peak_memory（分割后每个 sub-batch 更小）、step_time
+
+experiment:
+  name: "ablation_c3po_plus_only"
+  stage: "rl"
+  algorithm: "grpo"
+  seed: 42
+  output_dir: "outputs/rl/ablation_c3po_plus"
+
+runtime:
+  device: "auto"
+  precision: "bf16"
+  tp_size: 1
+  dp_size: 1
+  inference_backend: "custom"
+  deterministic: false
+
+model:
+  name_or_path: "./models/Qwen3-0.6B"
+  max_seq_len: 2048
+  use_flash_attn: false
+  attention_backend: "sdpa"
+
+data:
+  dataset_name: "./data/gsm8k"
+  dataset_config: null
+  split: "train"
+  max_samples: 100
+  prompt_template: "qwen3_math"
+
+rollout:
+  num_samples_per_prompt: 4
+  max_tokens: 256
+  temperature: 0.7
+  top_p: 0.95
+
+reward:
+  type: "gsm8k_rule"
+  answer_format: "#### {answer}"
+  correct_reward: 1.0
+  format_reward: -0.5
+  wrong_reward: -1.0
+
+training:
+  mode: "grpo"
+  total_iterations: 5
+  batch_size: 2
+  train_steps_per_iteration: 1
+  gradient_accumulation_steps: 1
+  learning_rate: 1.0e-5
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  grpo_beta: 0.1
+  grpo_clip_eps: 0.2
+
+lora:
+  enabled: true
+  rank: 8
+  alpha: 16
+  dropout: 0.0
+  target_modules:
+    - "q_proj"
+    - "k_proj"
+    - "v_proj"
+    - "o_proj"
+    - "gate_proj"
+    - "up_proj"
+    - "down_proj"
+
+checkpoint:
+  save_dir: "checkpoints/rl/ablation_c3po_plus"
+  save_interval: 100
+  resume_from: null
+
+eval:
+  num_prompts: 0
+  max_tokens: 256
+
+icepop:
+  enabled: false
+  divergence_threshold: 0.5
+  max_mask_ratio: 0.5
+  log_diagnostics: false
+
+# === C3PO++ 启用（token_budget=128 强制触发分割） ===
+c3po_plus:
+  enabled: true
+  token_budget: 128
+  target_batch_tokens: 2048
+  packing_strategy: "ffd"
+
+swift_sync:
+  enabled: false
+  fallback_full_every: 10
+  double_buffer: true

@@ -121,6 +121,7 @@ class NCCLWeightTransfer:
 
         broadcast_time = time.perf_counter() - t0
 
+        # 计算checksum
         checksum = self._compute_checksum(state_dict)
 
         # 更新版本
@@ -133,6 +134,7 @@ class NCCLWeightTransfer:
             version_list, src=self.src_rank, group=self.process_group
         )
 
+        # 更新统计
         self._stats.total_params = len(param_names)
         self._stats.total_bytes = total_bytes
         self._stats.broadcast_time = broadcast_time
@@ -256,10 +258,12 @@ class RayObjectStoreTransfer:
         }
         serial_time = time.perf_counter() - t_serial
 
+        # 计算统计
         total_bytes = sum(
             t.nelement() * t.element_size() for t in cpu_state_dict.values()
         )
 
+        # 计算checksum
         checksum = self._compute_checksum(cpu_state_dict)
 
         # 更新版本
@@ -276,6 +280,7 @@ class RayObjectStoreTransfer:
             self._weight_ref = weight_ref
             self._version_ref = version_ref
 
+        # 更新统计
         self._stats.total_params = len(cpu_state_dict)
         self._stats.total_bytes = total_bytes
         self._stats.serialization_time = serial_time

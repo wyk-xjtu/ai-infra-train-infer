@@ -144,6 +144,7 @@ class ParallelContext:
 
         # 创建PP进程组：stride=tp_size，pp_size 个成员
         # PP group 包含相同 (dp_rank, tp_rank) 但不同 pp_rank 的 rank
+        # base = dp_rank*(pp_size*tp_size) + tp_rank; members = base + pp_idx*tp_size
         pp_group: Optional[ProcessGroup] = None
         if pp_size > 1:
             for dp_idx in range(dp_size):
@@ -156,6 +157,7 @@ class ParallelContext:
 
         # 创建DP进程组：stride=pp_size*tp_size，dp_size 个成员
         # DP group 包含相同 (pp_rank, tp_rank) 但不同 dp_rank 的 rank
+        # base = pp_rank*tp_size + tp_rank; members = base + dp_idx*(pp_size*tp_size)
         # 当 pp_size=1 时，stride 退化为 tp_size，与旧布局一致。
         dp_group: Optional[ProcessGroup] = None
         if dp_size > 1:

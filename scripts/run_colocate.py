@@ -34,7 +34,7 @@ def parse_args():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--config", type=str, default=None,
-                        help="Optional YAML config path, e.g. configs/sft.yaml")
+                        help="Optional YAML config path, e.g. configs/training/sft.yaml")
     parser.add_argument("--model", type=str, default=None,
                         help="HuggingFace model path or name")
     parser.add_argument("--tp-size", type=int, default=None,
@@ -147,11 +147,13 @@ async def main():
     import torch, os
     deterministic = get_nested(cfg, "runtime.deterministic", False)
 
+    # ============================================================
     # [关键修复] PyTorch 2.12 新增 cuDNN SDPA 后端，其内部调用 cuBLASLt。
     # H20 + CUDA 13.0 环境中 cuBLASLt 存在符号加载 bug：
     #   "Invalid handle. Cannot load symbol cublasLtGetVersion"
     # 必须全局禁用 cudnn_sdp 后端，否则任何 F.scaled_dot_product_attention
     # 调用都可能触发 SIGABRT。此设置与 deterministic 无关。
+    # ============================================================
     torch.backends.cuda.enable_cudnn_sdp(False)
     logger.info("Disabled cudnn_sdp backend (cuBLASLt incompatible on H20/CUDA 13.0)")
 
@@ -234,18 +236,37 @@ async def main():
         response_field=get_nested(cfg, "data.response_field", "answer"),
         answer_field=get_nested(cfg, "data.answer_field", "answer"),
         eval_max_tokens=get_nested(cfg, "eval.max_tokens", 128),
-        eval_num_prompts=get_nested(cfg, "eval.num_prompts", 3),
+        eval_num_prompts=get_nested(cfg, "eval.num_prompts", 0),
         enable_comm_overlap=get_nested(cfg, "runtime.enable_comm_overlap", False),
         zero_stage=get_nested(cfg, "training.zero_stage", 1),
         inference_preview_enabled=get_nested(cfg, "inference_preview.enabled", True),
         enable_profiling=get_nested(cfg, "profiling.enabled", False),
         profile_interval=get_nested(cfg, "profiling.interval", 10),
+        # IcePop 训推对齐检测
+        icepop_enabled=get_nested(cfg, "icepop.enabled", False),
+        icepop_divergence_threshold=get_nested(cfg, "icepop.divergence_threshold", 0.5),
+        icepop_max_mask_ratio=get_nested(cfg, "icepop.max_mask_ratio", 0.5),
+        # C3PO++ 动态 Rollout 分割调度
+        c3po_plus_enabled=get_nested(cfg, "c3po_plus.enabled", False),
+        c3po_plus_token_budget=get_nested(cfg, "c3po_plus.token_budget", 1024),
+        c3po_plus_target_batch_tokens=get_nested(cfg, "c3po_plus.target_batch_tokens", 4096),
+        c3po_plus_packing_strategy=get_nested(cfg, "c3po_plus.packing_strategy", "ffd"),
+        # SwiftSync 增量权重同步
+        swift_sync_enabled=get_nested(cfg, "swift_sync.enabled", False),
+        swift_sync_fallback_full_every=get_nested(cfg, "swift_sync.fallback_full_every", 10),
+        swift_sync_double_buffer=get_nested(cfg, "swift_sync.double_buffer", True),
+        # 异步 Pipeline
+        async_pipeline_enabled=get_nested(cfg, "async_pipeline.enabled", False),
+        async_pipeline_max_staleness=get_nested(cfg, "async_pipeline.max_staleness", 2),
+        async_pipeline_queue_size=get_nested(cfg, "async_pipeline.queue_size", 2),
     )
 
     if args.config:
         logger.info(f"Loaded config: {args.config}")
 
+    # ============================================================
     # 并行配置校验（pp/tp/dp、num_micro_batches、global_batch、PP+ZeRO 限制）
+    # ============================================================
     _validate_parallel_config(config, logger)
 
     logger.info(f"Starting Colocate mode: model={config.model_path}, tp={config.tp_size}, dp={config.dp_size}, iters={config.total_iterations}")

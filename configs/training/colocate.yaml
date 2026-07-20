@@ -1,0 +1,28 @@
+colocate:
+  # 训练配置
+  training:
+    batch_size: 4
+    gradient_accumulation_steps: 4
+    learning_rate: 1.0e-5
+    num_train_epochs: 1
+    warmup_steps: 10
+    
+  # 推理配置  
+  inference:
+    vllm_url: "http://localhost:8000"
+    max_tokens: 512
+    temperature: 0.7
+    top_p: 0.9
+    num_samples_per_prompt: 4  # GRPO: K个回复
+    
+  # 权重同步
+  weight_sync:
+    backend: "ipc"  # ipc or nccl
+    chunk_size: 16
+    sleep_level: 1  # vLLM sleep mode level
+    
+  # 调度
+  orchestrator:
+    num_iterations: 50
+    log_interval: 5
+    save_interval: 10

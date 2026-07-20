@@ -90,8 +90,10 @@ class Request:
     @property
     def is_finished(self) -> bool:
         """是否完成生成"""
+        # 条件1: 达到最大生成长度
         if self.num_generated_tokens >= self.max_tokens:
             return True
+        # 条件2: 生成了EOS token (假设EOS=2)
         if self.output_tokens and self.output_tokens[-1] == 2:
             return True
         return False
@@ -153,7 +155,8 @@ class ContinuousBatchingScheduler:
                  max_num_sequences: int = 256,
                  max_prefill_tokens: int = 1024,
                  enable_chunked_prefill: bool = True,
-                 chunk_size: int = 512):
+                 chunk_size: int = 512,
+                 enable_adaptive_chunking: bool = True):
         """
         Args:
             max_num_batched_tokens: 每步最大token数（硬上限，防OOM）
@@ -161,16 +164,20 @@ class ContinuousBatchingScheduler:
             max_prefill_tokens: 单步最大prefill token数（避免prefill独占）
             enable_chunked_prefill: 是否启用分块prefill
             chunk_size: 每次prefill处理的最大token数/请求
+            enable_adaptive_chunking: 是否启用自适应chunk_size调整
         """
         self.max_num_batched_tokens = max_num_batched_tokens
         self.max_num_sequences = max_num_sequences
         self.max_prefill_tokens = max_prefill_tokens
         self.enable_chunked_prefill = enable_chunked_prefill
         self.chunk_size = chunk_size
+        self.enable_adaptive_chunking = enable_adaptive_chunking
 
+        # 两级队列
         self.waiting_queue: List[Request] = []
         self.running_queue: List[Request] = []
 
+        # 统计
         self._total_scheduled = 0
         self._total_preempted = 0
         self._total_finished = 0
@@ -194,9 +201,11 @@ class ContinuousBatchingScheduler:
         """
         output = SchedulerOutput(chunk_size=self.chunk_size)
 
+        # === Step 1: 处理running队列（Decode） ===
         # 每个running序列需要1个token的budget
         decode_budget_needed = len(self.running_queue)
 
+        # === Step 2: 如果decode都装不下，需要抢占 ===
         while decode_budget_needed > self.max_num_batched_tokens:
             preempted = self._preempt_one()
             if preempted is None:
@@ -214,10 +223,12 @@ class ContinuousBatchingScheduler:
         # 所有running序列参与decode
         output.decode_requests = list(self.running_queue)
 
+        # === Step 3: 计算剩余budget ===
         remaining_budget = self.max_num_batched_tokens - len(self.running_queue)
         prefill_budget = min(remaining_budget, self.max_prefill_tokens)
         available_seq_slots = self.max_num_sequences - len(self.running_queue)
 
+        # === Step 4: 调度Prefill请求 ===
         if prefill_budget > 0 and available_seq_slots > 0 and self.waiting_queue:
             scheduled_prefill = self._schedule_prefill(prefill_budget, available_seq_slots)
             output.prefill_requests = scheduled_prefill
@@ -225,11 +236,30 @@ class ContinuousBatchingScheduler:
         self._total_scheduled += 1
         return output
 
+    def _get_adaptive_chunk_size(self) -> int:
+        """根据 decode 队列压力动态调整 chunk_size
+
+        策略:
+        - decode 队列积压时减小 chunk_size，让出预算给 decode
+        - 无 decode 请求时加大 chunk_size 加速 prefill
+        - 其他情况使用默认 chunk_size
+        """
+        if not self.enable_adaptive_chunking:
+            return self.chunk_size
+        # decode 队列积压时减小 chunk_size，让出预算给 decode
+        if len(self.running_queue) > 3:
+            return max(self.chunk_size // 2, 128)
+        # 无 decode 请求时加大 chunk_size 加速 prefill
+        if len(self.running_queue) == 0:
+            return min(self.chunk_size * 2, 2048)
+        return self.chunk_size
+
     def _schedule_prefill(self, budget: int, max_new_seqs: int) -> List[Request]:
         """尝试调度Prefill请求
         
         FCFS策略：按到达顺序逐个尝试调度。
         Chunked Prefill: 每个请求最多消耗chunk_size个token。
+        支持自适应chunk_size: 根据decode队列压力动态调整。
         
         Args:
             budget: 可用token预算
@@ -242,6 +272,9 @@ class ContinuousBatchingScheduler:
         remaining = budget
         new_seqs = 0
 
+        # 使用自适应 chunk_size
+        effective_chunk_size = self._get_adaptive_chunk_size()
+
         to_remove = []
         for i, request in enumerate(self.waiting_queue):
             if new_seqs >= max_new_seqs:
@@ -250,7 +283,7 @@ class ContinuousBatchingScheduler:
             # 计算此请求本步消耗的token数
             tokens_remaining = request.remaining_prefill_tokens
             if self.enable_chunked_prefill:
-                tokens_this_step = min(tokens_remaining, self.chunk_size)
+                tokens_this_step = min(tokens_remaining, effective_chunk_size)
             else:
                 tokens_this_step = tokens_remaining
 
@@ -289,11 +322,13 @@ class ContinuousBatchingScheduler:
         if not self.running_queue:
             return None
 
+        # LIFO: 找最晚到达的（不修改原queue顺序）
         victim_idx = max(range(len(self.running_queue)),
                          key=lambda i: self.running_queue[i].arrival_time)
         victim = self.running_queue.pop(victim_idx)
 
         victim.state = RequestState.PREEMPTED
+        # 重置计算状态（需要重新prefill）
         victim.num_computed_tokens = 0
         victim.output_tokens.clear()
         victim.state = RequestState.WAITING

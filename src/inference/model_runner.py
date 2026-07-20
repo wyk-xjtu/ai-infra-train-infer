@@ -69,22 +69,33 @@ class ModelRunner:
         self.block_size = config.block_size
         self._kv_cache: Optional[torch.Tensor] = None
 
+        # HF 模型绑定（KV Cache 路径使用）
         self._hf_model: Optional[torch.nn.Module] = None
 
+        # CUDA Graph 相关
         self._cuda_graphs: Dict[int, torch.cuda.CUDAGraph] = {}
         self._graph_output_buffers: Dict[int, torch.Tensor] = {}
         self._graph_pool: Optional[object] = None
         self._graph_vars: Optional[Dict[str, torch.Tensor]] = None
         self._graph_batch_sizes: List[int] = []
 
-    def bind_kv_cache(self, kv_cache_tensor: torch.Tensor):
+    def bind_kv_cache(self, kv_cache_tensor: torch.Tensor,
+                      k_scale: Optional[torch.Tensor] = None,
+                      v_scale: Optional[torch.Tensor] = None,
+                      cache_dtype: str = "fp16"):
         """绑定预分配的 KV Cache tensor 到模型的 Attention 层
 
         Args:
             kv_cache_tensor: shape [2, num_layers, num_blocks, block_size, num_kv_heads, head_dim]
                             其中 [0]=K, [1]=V
+            k_scale: FP8 模式的 K scale tensor [num_layers, num_blocks, block_size]
+            v_scale: FP8 模式的 V scale tensor [num_layers, num_blocks, block_size]
+            cache_dtype: "fp16" 或 "fp8"
         """
         self._kv_cache = kv_cache_tensor
+        self._k_scale = k_scale
+        self._v_scale = v_scale
+        self._cache_dtype = cache_dtype
         if self.model is not None:
             self._bind_kv_cache_to_model()
 
@@ -93,8 +104,15 @@ class ModelRunner:
         layer_id = 0
         for module in self.model.modules():
             if isinstance(module, PagedAttention):
+                # 每层的 cache: [num_blocks, block_size, kv_heads, head_dim]
                 module.k_cache = self._kv_cache[0, layer_id]
                 module.v_cache = self._kv_cache[1, layer_id]
+                # FP8 模式: 绑定 scale tensors 和 dtype
+                module.cache_dtype = getattr(self, '_cache_dtype', 'fp16')
+                if self._k_scale is not None:
+                    module.k_scale = self._k_scale[layer_id]  # [num_blocks, block_size]
+                if self._v_scale is not None:
+                    module.v_scale = self._v_scale[layer_id]  # [num_blocks, block_size]
                 layer_id += 1
 
     def bind_hf_model(self, model: torch.nn.Module):
@@ -119,6 +137,7 @@ class ModelRunner:
         Returns:
             logits: [num_tokens_or_batch, vocab_size]
         """
+        # HF 模型 KV Cache 路径
         if self._hf_model is not None:
             return self._run_hf_model(input_ids, positions, is_prefill)
 
@@ -183,6 +202,7 @@ class ModelRunner:
         model = self._hf_model
         device = input_ids.device
 
+        # input_ids: [num_tokens] → [1, num_tokens] for HF model
         if input_ids.dim() == 1:
             input_ids_2d = input_ids.unsqueeze(0)
             positions_2d = positions.unsqueeze(0)
@@ -191,6 +211,7 @@ class ModelRunner:
             positions_2d = positions
 
         seq_len = input_ids_2d.shape[1]
+        # 构造 causal attention mask
         attention_mask = torch.ones(1, seq_len, dtype=torch.long, device=device)
 
         outputs = model(
@@ -204,6 +225,7 @@ class ModelRunner:
         if ctx.slot_mapping is not None and self._kv_cache is not None:
             self._store_hf_kv_to_paged_cache(outputs.past_key_values, ctx.slot_mapping)
 
+        # 返回 logits: [1, seq_len, vocab] → [seq_len, vocab]
         logits = outputs.logits.squeeze(0)
         return logits
 
@@ -222,6 +244,7 @@ class ModelRunner:
         device = input_ids.device
         batch_size = input_ids.shape[0]
 
+        # input_ids: [batch] → [batch, 1]
         if input_ids.dim() == 1:
             input_ids_2d = input_ids.unsqueeze(1)
             positions_2d = positions.unsqueeze(1)
@@ -257,6 +280,7 @@ class ModelRunner:
         if ctx.slot_mapping is not None and self._kv_cache is not None:
             self._store_hf_decode_kv_to_cache(outputs.past_key_values, ctx)
 
+        # logits: [batch, 1, vocab] → [batch, vocab]
         logits = outputs.logits.squeeze(1)
         return logits
 
@@ -276,6 +300,7 @@ class ModelRunner:
 
         for layer_idx in range(num_layers):
             k, v = self._extract_layer_kv(past_key_values, layer_idx)
+            # k shape: [1, num_kv_heads, seq_len, head_dim]
             # → [seq_len, num_kv_heads, head_dim] for store_kv_cache
             k = k.squeeze(0).transpose(0, 1).contiguous().to(cache_dtype)
             v = v.squeeze(0).transpose(0, 1).contiguous().to(cache_dtype)
@@ -356,6 +381,7 @@ class ModelRunner:
             k_flat = k_cache.view(num_blocks_total * block_size, num_kv_heads, head_dim)
             v_flat = v_cache.view(num_blocks_total * block_size, num_kv_heads, head_dim)
 
+            # 构造 gather 索引: [batch, max_past_len]
             # 每个 (batch_idx, token_pos) → physical_slot
             slot_indices = torch.zeros(
                 batch_size, max_past_len, dtype=torch.long, device=device
@@ -379,18 +405,21 @@ class ModelRunner:
                 batch_size, max_past_len, num_kv_heads, head_dim
             )
 
+            # 对不足 max_past_len 的序列，mask 掉（置零即可，attention_mask 会处理）
             for b in range(batch_size):
                 past_len_b = int(past_lens[b].item())
                 if past_len_b < max_past_len:
                     k_gathered[b, past_len_b:] = 0
                     v_gathered[b, past_len_b:] = 0
 
+            # HF 格式: [batch, num_kv_heads, seq_len, head_dim]
             k_layer = k_gathered.transpose(1, 2).contiguous()
             v_layer = v_gathered.transpose(1, 2).contiguous()
 
             all_keys.append(k_layer)
             all_values.append(v_layer)
 
+        # 构造 past_key_values (尝试使用 DynamicCache，fallback 到 tuple)
         try:
             from transformers import DynamicCache
             cache = DynamicCache()
@@ -398,6 +427,7 @@ class ModelRunner:
                 cache.update(all_keys[layer_idx], all_values[layer_idx], layer_idx)
             return cache
         except ImportError:
+            # Fallback: tuple of (K, V)
             return tuple(
                 (all_keys[i], all_values[i]) for i in range(num_layers)
             )
@@ -413,15 +443,18 @@ class ModelRunner:
         Returns:
             (k, v): 每个 shape [batch, num_kv_heads, seq_len, head_dim]
         """
+        # transformers 5.x DynamicCache (has .layers attribute)
         if hasattr(past_key_values, 'layers'):
             layer = past_key_values.layers[layer_idx]
             return layer.keys, layer.values
 
+        # transformers 4.x DynamicCache (has .key_cache attribute)
         if hasattr(past_key_values, 'key_cache'):
             k = past_key_values.key_cache[layer_idx]
             v = past_key_values.value_cache[layer_idx]
             return k, v
 
+        # Legacy tuple 格式: past_key_values[layer] = (K, V)
         layer_kv = past_key_values[layer_idx]
         if isinstance(layer_kv, (tuple, list)):
             return layer_kv[0], layer_kv[1]
@@ -477,6 +510,7 @@ class ModelRunner:
                         slot_end = block_table[i] * self.block_size + end - i * self.block_size
                     slot_mapping_list.extend(range(slot_start, slot_end))
 
+            # cumulative sequence lengths
             cu_seqlens_q.append(cu_seqlens_q[-1] + num_tokens)
             cu_seqlens_k.append(cu_seqlens_k[-1] + end)  # K 包含所有 token（含 cached）
             max_seqlen_q = max(max_seqlen_q, num_tokens)
@@ -489,6 +523,7 @@ class ModelRunner:
         input_ids = torch.tensor(input_ids_list, dtype=torch.long, device=device)
         positions = torch.tensor(positions_list, dtype=torch.long, device=device)
 
+        # 设置 context
         slot_mapping = torch.tensor(slot_mapping_list, dtype=torch.int32, device=device) if slot_mapping_list else None
         block_tables = self._prepare_block_tables(sequences, device) if has_prefix_cache else None
 
@@ -526,9 +561,11 @@ class ModelRunner:
             position = len(seq['token_ids']) - 1
             context_len = len(seq['token_ids'])
 
+            # 最后一个 token 的物理 slot
             block_table = seq['block_table']
             last_block_tokens = seq.get('last_block_num_tokens', None)
             if last_block_tokens is None:
+                # 从 position 计算
                 last_block_tokens = (position % self.block_size) + 1
             slot = block_table[-1] * self.block_size + last_block_tokens - 1
 
@@ -569,10 +606,13 @@ class ModelRunner:
             pass
 
         if temperature <= 0:
+            # Greedy decoding
             return torch.argmax(logits, dim=-1).tolist()
 
+        # Temperature scaling
         scaled_logits = logits.float() / temperature
 
+        # Top-p (nucleus) filtering
         if top_p < 1.0:
             sorted_logits, sorted_indices = torch.sort(scaled_logits, descending=True, dim=-1)
             probs = torch.softmax(sorted_logits, dim=-1)
@@ -585,6 +625,7 @@ class ModelRunner:
             mask[..., 0] = False
             sorted_logits[mask] = float('-inf')
 
+            # 还原到原始顺序
             scaled_logits = torch.zeros_like(scaled_logits).scatter_(
                 -1, sorted_indices, sorted_logits
             )
@@ -592,6 +633,79 @@ class ModelRunner:
         probs = torch.softmax(scaled_logits, dim=-1)
         return torch.multinomial(probs, num_samples=1).squeeze(-1).tolist()
 
+    # ==================== Batched Decode ====================
+
+    @torch.inference_mode()
+    def run_batch_decode(
+        self,
+        input_ids: torch.Tensor,       # [batch_size, 1] 每个序列的最新 token
+        positions: torch.Tensor,       # [batch_size] 每个序列当前的 position
+        block_tables: torch.Tensor,    # [batch_size, max_blocks] KV cache block 索引
+        context_lens: torch.Tensor,    # [batch_size] 每个序列的上下文长度
+    ) -> torch.Tensor:
+        """Batched decode forward，返回 [batch_size, vocab_size] logits
+
+        将多个序列的 decode 步骤合并为一次 model forward，显著提升 GPU 利用率。
+        每个序列独立使用自己的 KV cache blocks（通过 block_tables 索引）。
+
+        Args:
+            input_ids: [batch_size, 1] 或 [batch_size] — 每个序列最新生成的 token
+            positions: [batch_size] — 每个序列当前 token 的位置
+            block_tables: [batch_size, max_blocks] — 每个序列的物理 block 映射
+            context_lens: [batch_size] — 每个序列的上下文长度（含当前 token）
+
+        Returns:
+            logits: [batch_size, vocab_size]
+        """
+        batch_size = input_ids.shape[0]
+        device = input_ids.device
+
+        # 确保 input_ids 是 1D: [batch_size]
+        if input_ids.dim() == 2:
+            input_ids_flat = input_ids.squeeze(1)
+        else:
+            input_ids_flat = input_ids
+
+        # 计算 slot_mapping: 每个序列新 token 的物理 slot
+        block_size = self.block_size
+        slot_mapping_list = []
+        for i in range(batch_size):
+            token_pos = int(positions[i].item())
+            block_idx = token_pos // block_size
+            offset = token_pos % block_size
+            physical_block = int(block_tables[i, block_idx].item())
+            slot = physical_block * block_size + offset
+            slot_mapping_list.append(slot)
+
+        slot_mapping = torch.tensor(slot_mapping_list, dtype=torch.int32, device=device)
+
+        # 设置 decode 上下文
+        set_context(
+            is_prefill=False,
+            slot_mapping=slot_mapping,
+            context_lens=context_lens,
+            block_tables=block_tables,
+        )
+
+        # 执行 forward
+        if self._hf_model is not None:
+            logits = self._hf_decode_forward(input_ids_flat, positions, get_context())
+            reset_context()
+            return logits
+        elif self.model is not None:
+            logits = self.model(input_ids_flat, positions=positions)
+            reset_context()
+            return logits
+        else:
+            # Mock 模式: 返回随机 logits
+            logits = torch.randn(
+                batch_size, self.config.vocab_size,
+                device=device, dtype=torch.float32,
+            )
+            reset_context()
+            return logits
+
+    # ==================== CUDA Graph 管理 ====================
 
     def capture_cuda_graphs(self, batch_sizes: Optional[List[int]] = None):
         """为指定 batch sizes 录制 CUDA Graph（仅 decode 阶段使用）
@@ -625,6 +739,7 @@ class ModelRunner:
             set_context(False, slot_mapping=slot_mapping[:bs],
                        context_lens=context_lens[:bs], block_tables=block_tables[:bs])
             _ = self.model(input_ids[:bs], positions=positions[:bs])
+            # Capture
             with torch.cuda.graph(graph, pool=self._graph_pool):
                 output_buffer = self.model(input_ids[:bs], positions=positions[:bs])
             if self._graph_pool is None:
@@ -645,6 +760,7 @@ class ModelRunner:
     def _run_with_cuda_graph(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         """使用 CUDA Graph 回放执行 decode forward"""
         bs = input_ids.size(0)
+        # 找到 >= bs 的最小已录制 batch size
         graph_bs = next((x for x in self._graph_batch_sizes if x >= bs), None)
         if graph_bs is None or graph_bs not in self._cuda_graphs:
             return self.model(input_ids, positions=positions)
@@ -665,6 +781,7 @@ class ModelRunner:
             bt = ctx.block_tables
             gv["block_tables"][:bs, :bt.size(1)] = bt
 
+        # 回放
         self._cuda_graphs[graph_bs].replay()
         # 从 graph 录制时的 output buffer 中提取 logits
         logits = self._extract_logits_from_graph_buffer(graph_bs, bs)
@@ -681,6 +798,7 @@ class ModelRunner:
             logits: [bs, vocab_size] — 仅返回实际有效的部分
         """
         output_buffer = self._graph_output_buffers[graph_bs]
+        # replay 会 in-place 更新 output_buffer，直接切片返回有效部分
         return output_buffer[:bs]
 
     def invalidate_cuda_graphs(self):
@@ -691,6 +809,7 @@ class ModelRunner:
         self._graph_vars = None
         self._graph_batch_sizes = []
 
+    # ==================== 辅助方法 ====================
 
     def _prepare_block_tables(self, sequences: List[dict], device: str) -> torch.Tensor:
         """构造 block_tables tensor [num_seqs, max_blocks]"""
@@ -698,6 +817,7 @@ class ModelRunner:
         if not block_tables_list or all(len(bt) == 0 for bt in block_tables_list):
             return None
         max_blocks = max(len(bt) for bt in block_tables_list)
+        # 用 -1 填充（flash-attn 的约定）
         tables = torch.full(
             (len(sequences), max_blocks), -1,
             dtype=torch.int32, device=device,

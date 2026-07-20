@@ -135,6 +135,7 @@ class MetricsCollector:
             "total_elapsed_s": total_elapsed,
         }
 
+        # Timer统计
         timer_stats = {}
         for name, records in self._completed_timers.items():
             durations = [r.duration for r in records]
@@ -147,6 +148,7 @@ class MetricsCollector:
             }
         summary["timers"] = timer_stats
 
+        # Metrics统计
         metrics_stats = {}
         for key, values in self._metrics.items():
             metrics_stats[key] = {
@@ -158,6 +160,7 @@ class MetricsCollector:
             }
         summary["metrics"] = metrics_stats
 
+        # 吞吐量
         if "iteration" in self._completed_timers:
             n_iters = len(self._completed_timers["iteration"])
             if total_elapsed > 0:

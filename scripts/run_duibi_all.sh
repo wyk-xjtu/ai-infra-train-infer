@@ -1,4 +1,5 @@
 #!/bin/bash
+# =============================================================================
 # 对比实验全量运行脚本
 # 实验矩阵: 7并行策略 × 2 Attention后端 × 2训练模式 = 28组实验
 # 指标采集: 显存(peak/breakdown) / MFU / 吞吐 / 通信 / 训练loss
@@ -8,6 +9,7 @@
 #   bash scripts/run_duibi_all.sh single   # 只运行单卡实验
 #   bash scripts/run_duibi_all.sh dp2      # 只运行2卡DP实验
 #   bash scripts/run_duibi_all.sh tp4      # 只运行4卡TP实验
+# =============================================================================
 
 # 不使用 set -e，改为手动检查关键操作的退出码
 # set -e 会在 for 循环/函数调用中导致意外退出
@@ -93,6 +95,7 @@ echo " 过滤条件: $FILTER"
 echo " 可用GPU:  $NUM_GPUS"
 echo "============================================================="
 
+# ==================== 单卡实验 (tp=1, dp=1) ====================
 echo ""
 echo ">>> [Phase 1/4] 单卡实验"
 phase1_count=0
@@ -104,6 +107,7 @@ for config in "${CONFIG_DIR}"/*_single.yaml "${CONFIG_DIR}"/*_dp1.yaml; do
 done
 echo "[Phase 1] 找到 $phase1_count 个配置文件"
 
+# ==================== 2卡实验 (dp2/tp2) ====================
 echo ""
 echo ">>> [Phase 2/4] 2卡实验 (dp2 + tp2)"
 phase2_count=0
@@ -114,6 +118,7 @@ for config in "${CONFIG_DIR}"/*_dp2.yaml "${CONFIG_DIR}"/*_tp2.yaml; do
 done
 echo "[Phase 2] 找到 $phase2_count 个配置文件"
 
+# ==================== 4卡实验 (dp4/tp4) ====================
 echo ""
 echo ">>> [Phase 3/4] 4卡实验 (dp4 + tp4)"
 phase3_count=0
@@ -124,6 +129,7 @@ for config in "${CONFIG_DIR}"/*_dp4.yaml "${CONFIG_DIR}"/*_tp4.yaml; do
 done
 echo "[Phase 3] 找到 $phase3_count 个配置文件"
 
+# ==================== 8卡实验 (dp8/tp8) ====================
 echo ""
 echo ">>> [Phase 4/4] 8卡实验 (dp8 + tp8)"
 phase4_count=0
@@ -134,6 +140,7 @@ for config in "${CONFIG_DIR}"/*_dp8.yaml "${CONFIG_DIR}"/*_tp8.yaml; do
 done
 echo "[Phase 4] 找到 $phase4_count 个配置文件"
 
+# ==================== 汇总 ====================
 echo ""
 echo "============================================================="
 echo " 全部实验完成"

@@ -19,7 +19,9 @@ B. 退化场景 (dp_size<=1，例如 tp_size=2,dp_size=1 或单进程)  [X-2 修
    4. step() 能正常本地更新，且与标准 Adam 数值一致
 
 运行:
+    # 多进程（真正的 DP 场景 + 退化用例）
     torchrun --nproc_per_node=2 tests/test_zero_optim.py
+    # 单进程（仅退化用例）
     python tests/test_zero_optim.py
 """
 import os
@@ -40,6 +42,10 @@ def _is_main() -> bool:
     return True
 
 
+# =============================================================================
+# A. 真正的 DP 场景 (tp_size=1, dp_size>1)：ZeRO 在 dp_group 上分片是正确的
+# =============================================================================
+
 def test_dp_shard_size(ctx: ParallelContext):
     """DP 场景下各 rank 的参数分片大小为 padded_total / dp_size"""
     assert ctx.dp_size > 1, "test_dp_shard_size 需要 dp_size>1 的多进程环境"
@@ -59,11 +65,13 @@ def test_dp_shard_size(ctx: ParallelContext):
         lr=1e-3,
     )
 
+    # DP 场景：ZeRO 应使用 dp_group，world_size 应等于 dp_size
     assert optimizer.group is not None, "DP 场景下通信组不应为 None"
     assert optimizer.world_size == ctx.dp_size, (
         f"ZeRO world_size({optimizer.world_size}) 应等于 dp_size({ctx.dp_size})"
     )
 
+    # shard_size == padded_total / dp_size（按 DP 度分片）
     padded_total = optimizer._pad_to_divisible(total_params, ctx.dp_size)
     expected_shard = padded_total // ctx.dp_size
     assert optimizer.shard_size == expected_shard, (
@@ -102,15 +110,18 @@ def test_dp_step_consistency(ctx: ParallelContext):
 
     ref_optim = torch.optim.AdamW(model_ref.parameters(), lr=1e-3, weight_decay=0.0)
 
+    # 所有 rank 使用相同输入
     torch.manual_seed(100)
     x = torch.randn(4, 32)
 
+    # 标准 Adam 步
     out_ref = model_ref(x)
     loss_ref = out_ref.sum()
     loss_ref.backward()
     ref_optim.step()
     ref_optim.zero_grad()
 
+    # ZeRO 步（reduce_scatter + local step + all_gather）
     out_zero = model_zero(x)
     loss_zero = out_zero.sum()
     loss_zero.backward()
@@ -182,9 +193,11 @@ def test_dp_multiple_steps(ctx: ParallelContext):
         optimizer.step()
         optimizer.zero_grad()
 
+    # 参数应已更新
     param_diff = (model.weight.data - initial_params).abs().max().item()
     assert param_diff > 1e-6, f"Parameters should have changed after 5 steps, diff={param_diff}"
 
+    # AllGather 后各 DP rank 参数一致（分片在 dp_group 上）
     all_params = [torch.empty_like(model.weight.data) for _ in range(ctx.dp_size)]
     dist.all_gather(all_params, model.weight.data.contiguous(), group=ctx.dp_group)
 
@@ -196,6 +209,10 @@ def test_dp_multiple_steps(ctx: ParallelContext):
         print(f"  ✓ test_dp_multiple_steps passed (param change={param_diff:.4e})")
 
 
+# =============================================================================
+# B. 退化场景 (dp_size<=1)：X-2 修复后不回退 tp_group，退化为本地非分片优化器
+# =============================================================================
+
 def test_degenerate_no_sharding():
     """dp_size<=1 时 ZeRO 退化为本地非分片优化器
 
@@ -205,6 +222,7 @@ def test_degenerate_no_sharding():
     - shard_size == padded_size == total_params（不分片）
     - step() 正常本地更新，与标准 Adam 一致
     """
+    # 构造 dp_size=1 的并行上下文（纯 TP 场景 tp_size=2,dp_size=1；tp_group 不影响退化路径）
     degenerate_ctx = ParallelContext(
         tp_size=2, tp_group=None, dp_size=1, dp_group=None,
     )
@@ -225,6 +243,7 @@ def test_degenerate_no_sharding():
         weight_decay=0.0,
     )
 
+    # 核心断言：退化为本地非分片优化器
     assert zero_optim.group is None, (
         f"dp_size<=1 时通信组应为 None（不回退 tp_group），实际为 {zero_optim.group}"
     )
@@ -239,6 +258,7 @@ def test_degenerate_no_sharding():
         f"退化场景 shard_size({zero_optim.shard_size}) 应等于 total_params({total_params})"
     )
 
+    # step() 本地更新且与标准 Adam 数值一致
     ref_optim = torch.optim.AdamW(model_ref.parameters(), lr=1e-3, weight_decay=0.0)
 
     torch.manual_seed(100)
@@ -267,6 +287,7 @@ if __name__ == "__main__":
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
 
     if world_size > 1:
+        # torchrun 多进程：初始化为真正的 DP 场景 (tp_size=1, dp_size=world_size)
         dist.init_process_group(backend="gloo")  # gloo 支持 CPU，方便测试
         ctx = ParallelContext.init_distributed(
             tp_size=1, dp_size=dist.get_world_size(), backend="gloo"
@@ -293,6 +314,7 @@ if __name__ == "__main__":
 
         dist.destroy_process_group()
     else:
+        # 单进程：仅验证退化语义 (dp_size=1)
         ctx = ParallelContext.init_distributed(
             tp_size=1, dp_size=1, backend="gloo", init_single_process=True
         )

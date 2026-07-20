@@ -1,0 +1,64 @@
+# Pre-training / continued pre-training config.
+# This is a planning config for Linux rental GPU experiments; current local
+# Windows validation should start from configs/sft.yaml.
+
+experiment:
+  name: "qwen3_0_6b_pt_smoke"
+  stage: "pt"
+  seed: 42
+  output_dir: "outputs/pt/qwen3_0_6b"
+
+runtime:
+  device: "cuda"
+  precision: "bf16"
+  backend: "torch"
+  tp_size: 1
+  gradient_checkpointing: false
+
+model:
+  name_or_path: "./models/Qwen3-0.6B"
+  max_seq_len: 2048
+  trust_remote_code: true
+  use_flash_attn: false
+  attention_backend: "sdpa"
+
+data:
+  # Replace with a local text/jsonl corpus before using this stage.
+  dataset_name: null
+  train_file: "./data/pt/train.txt"
+  validation_file: null
+  text_field: "text"
+  streaming: false
+  max_samples: null
+  num_workers: 2
+
+training:
+  objective: "causal_lm"
+  total_steps: 1000
+  batch_size: 1
+  gradient_accumulation_steps: 8
+  learning_rate: 2.0e-5
+  weight_decay: 0.1
+  warmup_steps: 100
+  max_grad_norm: 1.0
+  logging_steps: 10
+  save_steps: 200
+  eval_steps: 200
+
+lora:
+  enabled: false
+  rank: 16
+  alpha: 32
+  dropout: 0.0
+  target_modules:
+    - "q_proj"
+    - "k_proj"
+    - "v_proj"
+    - "o_proj"
+    - "gate_proj"
+    - "up_proj"
+    - "down_proj"
+
+checkpoint:
+  resume_from: null
+  save_total_limit: 3

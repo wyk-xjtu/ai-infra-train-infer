@@ -64,6 +64,7 @@ class CUDAGraphRunner:
         # 共享的 graph memory pool (所有graph共用，减少显存碎片)
         self._graph_pool = None
 
+        # 统计
         self._replay_count = 0
         self._capture_count = 0
 
@@ -98,6 +99,7 @@ class CUDAGraphRunner:
         if not torch.cuda.is_available():
             return  # CPU 环境跳过
 
+        # 1. 预分配 input/output buffers (固定shape，graph期间不能变)
         input_ids = torch.zeros(batch_size, dtype=torch.long, device=device)
         positions = torch.zeros(batch_size, dtype=torch.long, device=device)
         output_buffer = torch.zeros(batch_size, hidden_size, dtype=dtype, device=device)
@@ -107,9 +109,11 @@ class CUDAGraphRunner:
         for name, shape in extra_buffer_shapes.items():
             extra_buffers[name] = torch.zeros(shape, dtype=torch.int32, device=device)
 
+        # 2. Warmup — 确保所有 lazy 分配完成
         for _ in range(num_warmup):
             output_buffer[:] = model_forward_fn(input_ids, positions, **extra_buffers)
 
+        # 3. 录制 Graph
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, pool=self._graph_pool):
             output_buffer[:] = model_forward_fn(input_ids, positions, **extra_buffers)
@@ -118,6 +122,7 @@ class CUDAGraphRunner:
         if self._graph_pool is None:
             self._graph_pool = graph.pool()
 
+        # 4. 保存引用
         self._graphs[batch_size] = graph
         self._input_buffers[batch_size] = {
             "input_ids": input_ids,
@@ -182,6 +187,7 @@ class CUDAGraphRunner:
                 slices = tuple(slice(0, min(a, b)) for a, b in zip(actual_shape, buf_shape))
                 buffers[key][slices].copy_(value_src[slices])
 
+        # 回放 Graph — 一次 API 调用重放所有 kernel
         graph.replay()
         self._replay_count += 1
 

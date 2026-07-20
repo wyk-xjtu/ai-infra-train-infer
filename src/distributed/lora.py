@@ -38,6 +38,11 @@ from .tensor_parallel import ColumnParallelLinear, RowParallelLinear
 from .comm import reduce_from_parallel_region
 
 
+# ============================================================
+# Base LoRA Layer
+# ============================================================
+
+
 class LoRALayer(nn.Module):
     """LoRA 基础层
 
@@ -70,9 +75,12 @@ class LoRALayer(nn.Module):
         self.in_features = in_features
         self.out_features = out_features
 
+        # A: [rank, in_features] — 降维矩阵
         self.lora_A = nn.Parameter(torch.empty(rank, in_features))
+        # B: [out_features, rank] — 升维矩阵
         self.lora_B = nn.Parameter(torch.empty(out_features, rank))
 
+        # Dropout (可选)
         self.lora_dropout = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
 
         self._init_weights()
@@ -99,15 +107,20 @@ class LoRALayer(nn.Module):
         lora_input = x
         if x.dtype != self.lora_A.dtype:
             lora_input = x.to(self.lora_A.dtype)
+        # x @ A^T: [batch, seq, in_features] @ [in_features, rank] → [batch, seq, rank]
         intermediate = F.linear(lora_input, self.lora_A)
+        # intermediate @ B^T: [batch, seq, rank] @ [rank, out_features] → [batch, seq, out_features]
         output = F.linear(intermediate, self.lora_B)
         output = output * self.scaling
+        # 将输出 cast 回输入 dtype，确保与 base output 相加时 dtype 一致
         if output.dtype != input_dtype:
             output = output.to(input_dtype)
         return output
 
 
+# ============================================================
 # TP-Compatible LoRA Variants
+# ============================================================
 
 
 class LoRAColumnParallel(LoRALayer):
@@ -135,11 +148,14 @@ class LoRAColumnParallel(LoRALayer):
         tp_rank = parallel_context.tp_rank
         self.parallel_context = parallel_context
 
+        # out_features 需按 tp_size 切分
         assert out_features % tp_size == 0
         out_features_per_rank = out_features // tp_size
 
+        # 调用父类初始化（使用切分后的 out_features）
         super().__init__(in_features, out_features_per_rank, rank, alpha, dropout)
 
+        # 标记 lora_A 为 TP-replicated（需要跨 tp_group AllReduce SUM 梯度）
         self.lora_A._tp_replicated = True
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -186,11 +202,14 @@ class LoRARowParallel(LoRALayer):
         tp_size = parallel_context.tp_size
         self.parallel_context = parallel_context
 
+        # in_features 需按 tp_size 切分
         assert in_features % tp_size == 0
         in_features_per_rank = in_features // tp_size
 
+        # 初始化: A 用切分的 in_features，B 用完整的 out_features
         super().__init__(in_features_per_rank, out_features, rank, alpha, dropout)
 
+        # 标记 lora_B 为 TP-replicated（梯度天然一致，但标记以备后用）
         self.lora_B._tp_replicated = True
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -204,14 +223,21 @@ class LoRARowParallel(LoRALayer):
         lora_input = x
         if x.dtype != self.lora_A.dtype:
             lora_input = x.to(self.lora_A.dtype)
+        # x_local @ A_local^T: 每个 rank 计算部分贡献
         intermediate = F.linear(lora_input, self.lora_A)  # [batch, seq, rank]
         # AllReduce 聚合中间结果（因为完整 intermediate = Σ(x_i @ A_i^T)）
         intermediate = reduce_from_parallel_region(intermediate, self.parallel_context.tp_group)
+        # 完整 intermediate @ B^T
         output = F.linear(intermediate, self.lora_B)  # [batch, seq, out_features]
         output = output * self.scaling
         if output.dtype != input_dtype:
             output = output.to(input_dtype)
         return output
+
+
+# ============================================================
+# LoRA 注入工具函数
+# ============================================================
 
 
 class LinearWithLoRA(nn.Module):
@@ -226,6 +252,7 @@ class LinearWithLoRA(nn.Module):
         self.lora = lora_layer
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # 原始输出 + LoRA 增量
         return self.original_layer(x) + self.lora(x)
 
 
@@ -258,9 +285,11 @@ def apply_lora(
     target_modules: List[str] = lora_config.get("target_modules", [])
     dropout = lora_config.get("dropout", 0.0)
 
+    # Step 1: 冻结所有原始参数
     for param in model.parameters():
         param.requires_grad = False
 
+    # Step 2: 为目标层添加 LoRA
     for name, module in model.named_modules():
         # 检查模块名是否匹配 target_modules
         module_name = name.split(".")[-1]
@@ -268,6 +297,7 @@ def apply_lora(
             continue
 
         if isinstance(module, ColumnParallelLinear):
+            # ColumnParallel: 使用 LoRAColumnParallel
             lora_layer = LoRAColumnParallel(
                 in_features=module.in_features,
                 out_features=module.out_features,
@@ -280,6 +310,7 @@ def apply_lora(
             _replace_module(model, name, LinearWithLoRA(module, lora_layer))
 
         elif isinstance(module, RowParallelLinear):
+            # RowParallel: 使用 LoRARowParallel
             lora_layer = LoRARowParallel(
                 in_features=module.in_features,
                 out_features=module.out_features,
@@ -291,6 +322,7 @@ def apply_lora(
             _replace_module(model, name, LinearWithLoRA(module, lora_layer))
 
         elif isinstance(module, nn.Linear):
+            # 普通 Linear: 使用基础 LoRALayer
             lora_layer = LoRALayer(
                 in_features=module.in_features,
                 out_features=module.out_features,
@@ -300,6 +332,7 @@ def apply_lora(
             )
             _replace_module(model, name, LinearWithLoRA(module, lora_layer))
 
+    # 打印可训练参数统计
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total_params = sum(p.numel() for p in model.parameters())
     print(
@@ -322,6 +355,11 @@ def _replace_module(model: nn.Module, target_name: str, new_module: nn.Module):
     setattr(parent, parts[-1], new_module)
 
 
+# ============================================================
+# LoRA 权重合并 (用于推理部署)
+# ============================================================
+
+
 def merge_lora_weights(model: nn.Module) -> dict:
     """合并 LoRA 权重到原始权重，导出用于推理
 
@@ -342,17 +380,21 @@ def merge_lora_weights(model: nn.Module) -> dict:
             original = module.original_layer
             lora = module.lora
 
+            # 获取原始权重
             if hasattr(original, "weight"):
                 weight = original.weight.data.clone()
                 # 合并: W_merged = W + scaling * B @ A
+                # B: [out, rank], A: [rank, in]
                 # B @ A: [out, in] — 与 weight 形状一致
                 lora_weight = lora.lora_B @ lora.lora_A  # [out, in]
                 weight += lora.scaling * lora_weight.to(weight.dtype)
                 merged_state_dict[name + ".weight"] = weight
 
+                # Bias (如果有)
                 if hasattr(original, "bias") and original.bias is not None:
                     merged_state_dict[name + ".bias"] = original.bias.data.clone()
         else:
+            # 非 LoRA 模块直接保存
             for param_name, param in module.named_parameters(recurse=False):
                 full_name = f"{name}.{param_name}" if name else param_name
                 if full_name not in merged_state_dict:

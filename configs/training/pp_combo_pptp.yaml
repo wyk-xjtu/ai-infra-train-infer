@@ -1,0 +1,72 @@
+# PP+TP 组合验证: pp2 tp2 dp1, 4卡
+# torchrun --nproc_per_node=4 scripts/run_colocate.py --config configs/training/pp_combo_pptp.yaml
+
+experiment:
+  name: "pp_combo_pptp"
+  stage: "sft"
+  seed: 42
+  output_dir: "outputs/pp_combo_pptp"
+
+runtime:
+  device: "auto"
+  precision: "bf16"
+  tp_size: 2
+  dp_size: 1
+  inference_backend: "custom"
+  deterministic: false
+
+distributed:
+  pp_size: 2
+  num_micro_batches: 4
+
+model:
+  name_or_path: "./models/Qwen3-0.6B"
+  max_seq_len: 256
+  trust_remote_code: true
+  use_flash_attn: false
+  attention_backend: "sdpa"
+
+data:
+  dataset_name: "yahma/alpaca-cleaned"
+  dataset_config: null
+  split: "train"
+  max_samples: 32
+  prompt_template: "qwen3_instruction"
+  prompt_field: "instruction"
+  input_field: "input"
+  response_field: "output"
+  answer_field: null
+
+training:
+  mode: "sft"
+  total_iterations: 4
+  batch_size: 4
+  train_steps_per_iteration: 1
+  gradient_accumulation_steps: 1
+  learning_rate: 5.0e-5
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  lr_scheduler: "constant"
+  warmup_steps: 0
+  min_lr_ratio: 0.1
+  zero_stage: 0
+
+lora:
+  enabled: false
+  rank: 0
+  alpha: 64
+  dropout: 0.0
+
+inference_preview:
+  enabled: false
+  max_tokens: 1
+
+eval:
+  max_tokens: 8
+  num_prompts: 0
+
+checkpoint:
+  save_dir: "checkpoints/pp_combo_pptp"
+  save_interval: 0
+  save_enabled: false
+  resume_from: null

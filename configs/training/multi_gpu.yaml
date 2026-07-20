@@ -1,0 +1,83 @@
+# Multi-GPU TP+DP hybrid parallel config.
+# Example: 8 x H20, tp_size=2, dp_size=4 (total 8 GPUs)
+#
+# Usage:
+#   torchrun --nproc_per_node=8 scripts/run_colocate.py --config configs/multi_gpu.yaml
+
+experiment:
+  name: "qwen3_8b_tp2_dp4"
+  stage: "rl"
+  algorithm: "grpo"
+  seed: 42
+  output_dir: "outputs/rl/qwen3_8b_multi_gpu"
+
+runtime:
+  device: "auto"
+  precision: "bf16"
+  tp_size: 2
+  dp_size: 4
+  inference_backend: "custom"
+  deterministic: false
+  enable_comm_overlap: true
+
+model:
+  name_or_path: "./models/Qwen3-8B"
+  max_seq_len: 2048
+  trust_remote_code: true
+  use_flash_attn: true
+  attention_backend: "flash_attn"
+
+data:
+  dataset_name: "openai/gsm8k"
+  dataset_config: "main"
+  split: "train"
+  max_samples: 800
+  prompt_template: "qwen3_math"
+
+rollout:
+  num_samples_per_prompt: 4
+  max_tokens: 192
+  temperature: 0.7
+  top_p: 0.95
+
+reward:
+  type: "gsm8k_rule"
+  answer_format: "#### {answer}"
+  correct_reward: 1.0
+  format_reward: -0.5
+  wrong_reward: -1.0
+
+training:
+  mode: "grpo"
+  total_iterations: 50
+  batch_size: 2
+  train_steps_per_iteration: 1
+  gradient_accumulation_steps: 4
+  learning_rate: 1.0e-5
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  grpo_beta: 0.1
+  grpo_clip_eps: 0.2
+
+lora:
+  enabled: true
+  rank: 16
+  alpha: 32
+  dropout: 0.0
+  target_modules:
+    - "q_proj"
+    - "k_proj"
+    - "v_proj"
+    - "o_proj"
+    - "gate_proj"
+    - "up_proj"
+    - "down_proj"
+
+checkpoint:
+  save_dir: "checkpoints/rl/qwen3_8b_multi_gpu"
+  save_interval: 10
+  resume_from: null
+
+eval:
+  num_prompts: 20
+  max_tokens: 192

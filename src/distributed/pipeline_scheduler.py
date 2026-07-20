@@ -98,7 +98,9 @@ class PipelineScheduler:
         # 末 stage：累积 loss（detach，用于日志/返回）
         self._accumulated_loss: Optional[torch.Tensor] = None
 
+    # ------------------------------------------------------------------
     # 计算步骤（不含跨 stage 通信；通信由 run_1f1b_schedule 编排）
+    # ------------------------------------------------------------------
 
     def forward_step(
         self,
@@ -164,7 +166,9 @@ class PipelineScheduler:
             return input_tensor.grad
         return None
 
+    # ------------------------------------------------------------------
     # 主调度
+    # ------------------------------------------------------------------
 
     def run_1f1b_schedule(self, model, micro_batch_iterator: Iterable) -> Optional[torch.Tensor]:
         """执行一次 1F1B 调度（warmup → steady → cooldown）。
@@ -189,6 +193,7 @@ class PipelineScheduler:
         self._pending_losses.clear()
         self._accumulated_loss = None
 
+        # ---- 单 stage 快路径（pp_size==1）：逐 micro-batch 前向+反向 ----
         if pp.pp_size == 1:
             for input_ids, labels in batches:
                 self.forward_step(
@@ -197,6 +202,7 @@ class PipelineScheduler:
                 self.backward_step(None)
             return self._accumulated_loss
 
+        # ---- 形状握手（一次，单向前传）----
         act_shape = self._resolve_act_shape(model, batches, device)
 
         num_warmup = min(pp.pp_size - 1 - pp.pp_rank, self.num_micro_batches)
@@ -204,6 +210,7 @@ class PipelineScheduler:
 
         mb_idx = 0  # 前向 micro-batch 指针
 
+        # ---- WARMUP：只前向 ----
         for _ in range(num_warmup):
             input_tensor = self._recv_activation(batches, mb_idx, act_shape, dtype, device)
             labels = self._labels_for(batches, mb_idx, device)
@@ -212,10 +219,12 @@ class PipelineScheduler:
                 send_forward(output_tensor, pp.next_rank, pp.pp_group)
             mb_idx += 1
 
+        # ---- 预取稳态第一个前向的输入 ----
         input_tensor = None
         if num_remaining > 0:
             input_tensor = self._recv_activation(batches, mb_idx, act_shape, dtype, device)
 
+        # ---- STEADY：交替 1F1B ----
         for i in range(num_remaining):
             last_iter = i == num_remaining - 1
             labels = self._labels_for(batches, mb_idx, device)
@@ -252,6 +261,7 @@ class PipelineScheduler:
                     if input_tensor is not None:
                         input_tensor.requires_grad_(True)
 
+        # ---- COOLDOWN：只反向，排空 warmup 期堆积的 micro-batch ----
         for _ in range(num_warmup):
             if pp.is_last_stage:
                 grad_output = None
@@ -265,7 +275,9 @@ class PipelineScheduler:
 
         return self._accumulated_loss if pp.is_last_stage else None
 
+    # ------------------------------------------------------------------
     # 内部工具
+    # ------------------------------------------------------------------
 
     def _resolve_act_shape(self, model, batches, device):
         """一次性形状握手：返回本 stage 需要接收/发送的 activation 形状。

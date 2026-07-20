@@ -1,0 +1,30 @@
+disaggregated:
+  # 资源分配
+  resources:
+    train_gpus: [0, 1]  # GPU 0-1 for training
+    infer_gpus: [2, 3]  # GPU 2-3 for inference
+    tp_size: 2
+    
+  # 训练配置
+  training:
+    batch_size: 4
+    gradient_accumulation_steps: 4
+    learning_rate: 1.0e-5
+    
+  # 推理配置
+  inference:
+    vllm_tp_size: 2
+    max_tokens: 512
+    temperature: 0.7
+    num_samples_per_prompt: 4
+    
+  # 权重同步
+  weight_sync:
+    backend: "nccl"  # nccl or ray_object_store
+    async_update: true
+    
+  # Pipeline调度
+  pipeline:
+    overlap_training_inference: true
+    weight_version_management: true
+    max_pending_requests: 32

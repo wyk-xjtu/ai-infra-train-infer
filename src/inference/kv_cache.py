@@ -18,10 +18,25 @@ PagedAttention 的解法:
   - 传统: batch_size × max_seq_len × 2(K,V) × num_layers × num_kv_heads × head_dim × dtype_bytes
   - PagedAttention: 只分配实际使用的blocks → 利用率从 ~50% 提升到 ~95%
 """
+import logging
+import warnings
+
 import torch
 from typing import Dict, List, Optional, Set
 from dataclasses import dataclass, field
 from collections import deque
+
+_logger = logging.getLogger(__name__)
+
+# FP8 dtype 可用性检测（需要 PyTorch >= 2.1）
+try:
+    _FP8_DTYPE = torch.float8_e4m3fn
+    # 验证能否实际创建 tensor
+    torch.tensor([1.0], dtype=_FP8_DTYPE)
+    HAS_FP8 = True
+except (AttributeError, RuntimeError):
+    HAS_FP8 = False
+    _FP8_DTYPE = None
 
 
 @dataclass
@@ -60,13 +75,18 @@ class BlockPool:
 
     def __init__(self, num_blocks: int, block_size: int,
                  num_layers: int, num_kv_heads: int, head_dim: int,
-                 dtype: torch.dtype = torch.float16, device: str = "cuda"):
+                 dtype: torch.dtype = torch.float16, device: str = "cuda",
+                 cache_dtype: str = "fp16"):
         """
         预分配KV Cache显存：
         总显存 = num_blocks × block_size × 2(K,V) × num_layers × num_kv_heads × head_dim × dtype_bytes
         
         示例（Qwen3-4B参数）:
         1024 blocks × 16 tokens × 2 × 32 layers × 8 heads × 128 dim × 2 bytes ≈ 16GB
+        
+        Args:
+            cache_dtype: KV Cache 存储精度，"fp16"（默认）或 "fp8"。
+                         FP8 模式下显存减半，但需要 PyTorch >= 2.1 支持。
         """
         self.num_blocks = num_blocks
         self.block_size = block_size
@@ -76,9 +96,25 @@ class BlockPool:
         self.dtype = dtype
         self.device = device
 
+        # KV Cache 量化配置
+        if cache_dtype == "fp8":
+            if HAS_FP8:
+                self.cache_dtype = "fp8"
+                _logger.info("KV Cache using FP8 (torch.float8_e4m3fn), memory reduced by ~50%%")
+            else:
+                self.cache_dtype = "fp16"
+                warnings.warn(
+                    "FP8 KV Cache requested but torch.float8_e4m3fn is not available "
+                    "(requires PyTorch >= 2.1). Falling back to FP16.",
+                    RuntimeWarning,
+                )
+        else:
+            self.cache_dtype = "fp16"
+
         # 创建所有物理block对象
         self._blocks: List[Block] = [Block(block_id=i) for i in range(num_blocks)]
         
+        # 空闲block队列（FIFO分配策略，也可改为LIFO提高cache局部性）
         self._free_queue: deque = deque(range(num_blocks))
         
         # 已使用的block id集合（用于快速判断）
@@ -87,6 +123,9 @@ class BlockPool:
         # 预分配GPU显存（教学实现中用cpu模拟，避免无GPU环境报错）
         # 生产环境应为: torch.empty(..., device=device, dtype=dtype)
         self._kv_cache: Optional[torch.Tensor] = None
+        # FP8 模式下的 per-token scale factors
+        self.k_scale: Optional[torch.Tensor] = None
+        self.v_scale: Optional[torch.Tensor] = None
         self._allocate_gpu_memory()
 
     def _allocate_gpu_memory(self):
@@ -99,20 +138,39 @@ class BlockPool:
         - 维度3: block内token位置
         - 维度4: KV head编号
         - 维度5: head维度
+        
+        FP8 模式下额外分配 per-token scale tensors:
+        - k_scale/v_scale shape: [num_layers, num_blocks, block_size]
+        - 每个 token 位置一个 scale 值（per-token 量化）
         """
+        actual_device = self.device if torch.cuda.is_available() else "cpu"
+        alloc_dtype = _FP8_DTYPE if (self.cache_dtype == "fp8" and HAS_FP8) else self.dtype
+
         try:
             self._kv_cache = torch.zeros(
                 2, self.num_layers, self.num_blocks,
                 self.block_size, self.num_kv_heads, self.head_dim,
-                dtype=self.dtype,
-                device=self.device if torch.cuda.is_available() else "cpu",
+                dtype=alloc_dtype,
+                device=actual_device,
             )
         except RuntimeError:
             # 显存不足时fallback到CPU（教学环境）
             self._kv_cache = torch.zeros(
                 2, self.num_layers, self.num_blocks,
                 self.block_size, self.num_kv_heads, self.head_dim,
-                dtype=self.dtype, device="cpu",
+                dtype=alloc_dtype, device="cpu",
+            )
+            actual_device = "cpu"
+
+        # FP8 模式下分配 per-token scale factors
+        if self.cache_dtype == "fp8":
+            self.k_scale = torch.ones(
+                self.num_layers, self.num_blocks, self.block_size,
+                dtype=torch.float32, device=actual_device,
+            )
+            self.v_scale = torch.ones(
+                self.num_layers, self.num_blocks, self.block_size,
+                dtype=torch.float32, device=actual_device,
             )
 
     def allocate(self) -> Optional[Block]:
@@ -275,6 +333,7 @@ class KVCacheManager:
     def __init__(self, block_pool: BlockPool, block_size: int = 16):
         self._pool = block_pool
         self._block_size = block_size
+        # seq_id → BlockTable 的映射
         self._seq_tables: Dict[str, BlockTable] = {}
 
     def allocate_for_sequence(self, seq_id: int, num_initial_tokens: int = 0) -> BlockTable:
@@ -340,6 +399,7 @@ class KVCacheManager:
         
         last_block = table.last_block
         
+        # 情况1: 尚未分配任何block（空序列的第一个token）
         if last_block is None:
             block = self._pool.allocate()
             if block is None:
@@ -349,11 +409,13 @@ class KVCacheManager:
             table.append_block(block)
             return True
         
+        # 情况2: 最后一个block还有空间
         if not last_block.is_full:
             last_block.token_count += 1
             last_block.is_full = (last_block.token_count == self._block_size)
             return True
         
+        # 情况3: 最后一个block已满，需要分配新block
         new_block = self._pool.allocate()
         if new_block is None:
             return False  # OOM

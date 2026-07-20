@@ -56,14 +56,15 @@ class ArtifactWriter:
         """写入per-rank的JSONL文件（每个rank写自己的）
 
         base_filename="metrics.jsonl" → 实际写入 "metrics_rank0.jsonl"
+        每次运行首次打开时使用覆盖模式('w')，后续追加。
         """
         name, ext = os.path.splitext(base_filename)
         actual_filename = f"{name}_rank{self.rank}{ext}"
         path = os.path.join(self.output_dir, actual_filename)
 
-        # 使用缓存的文件句柄（append模式）
+        # 首次打开使用 'w' 模式（覆盖），避免跨运行数据混淆
         if actual_filename not in self._rank_files:
-            self._rank_files[actual_filename] = open(path, 'a')
+            self._rank_files[actual_filename] = open(path, 'w')
 
         f = self._rank_files[actual_filename]
         f.write(json.dumps(row, default=str) + '\n')

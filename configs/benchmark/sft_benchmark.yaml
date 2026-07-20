@@ -1,0 +1,87 @@
+# SFT Benchmark config — 纯训练吞吐测试
+# 关闭 eval/preview，只跑训练步骤，建立干净的性能基线
+#
+# Usage:
+#   torchrun --nproc_per_node=4 scripts/run_colocate.py --config configs/sft_benchmark.yaml
+#   torchrun --nproc_per_node=2 scripts/run_colocate.py --config configs/sft_benchmark.yaml --dp-size 2
+#   python scripts/run_colocate.py --config configs/sft_benchmark.yaml --dp-size 1
+
+experiment:
+  name: "benchmark_dp4_bs4"
+  stage: "sft"
+  seed: 42
+  output_dir: "outputs/benchmark/dp4_bs4"
+
+runtime:
+  device: "auto"
+  precision: "bf16"
+  tp_size: 1
+  dp_size: 4
+  inference_backend: "custom"
+  deterministic: false
+  enable_comm_overlap: false
+
+model:
+  name_or_path: "./models/Qwen3-8B"
+  max_seq_len: 2048
+  trust_remote_code: true
+  use_flash_attn: false
+  attention_backend: "sdpa"
+
+data:
+  dataset_name: "yahma/alpaca-cleaned"
+  dataset_config: null
+  split: "train"
+  max_samples: 1000
+  prompt_template: "qwen3_instruction"
+  prompt_field: "instruction"
+  input_field: "input"
+  response_field: "output"
+  answer_field: null
+
+training:
+  mode: "sft"
+  total_iterations: 200
+  batch_size: 4
+  train_steps_per_iteration: 1
+  gradient_accumulation_steps: 4
+  learning_rate: 2.0e-5
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  lr_scheduler: "cosine"
+  warmup_steps: 20
+  min_lr_ratio: 0.1
+
+lora:
+  enabled: true
+  rank: 32
+  alpha: 64
+  dropout: 0.05
+  target_modules:
+    - "q_proj"
+    - "k_proj"
+    - "v_proj"
+    - "o_proj"
+    - "gate_proj"
+    - "up_proj"
+    - "down_proj"
+
+inference_preview:
+  enabled: false
+  max_tokens: 1
+  temperature: 0.7
+  top_p: 0.95
+
+eval:
+  max_tokens: 1
+  num_prompts: 0
+
+checkpoint:
+  save_dir: "checkpoints/benchmark"
+  save_interval: 9999
+  save_enabled: false
+  resume_from: null
+
+profiling:
+  enabled: true
+  interval: 50

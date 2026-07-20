@@ -94,8 +94,10 @@ def test_state_transitions():
 
         orchestrator = ColocateOrchestrator(config)
 
+        # 验证初始状态
         assert orchestrator.state == OrchestratorState.INIT
 
+        # 模拟状态转换
         await orchestrator._transition(OrchestratorState.INFERRING)
         assert orchestrator.state == OrchestratorState.INFERRING
 
@@ -132,10 +134,13 @@ def test_error_recovery():
         orchestrator = ColocateOrchestrator(config)
         orchestrator._vllm_client = MockVLLMClient()
 
+        # 模拟同步阶段错误
         error = RuntimeError("Sync failed")
         await orchestrator._handle_error(error, "syncing")
 
+        # 验证状态转为ERROR
         assert orchestrator.state == OrchestratorState.ERROR
+        # 验证恢复尝试（wake_up被调用）
         assert orchestrator._vllm_client.wake_calls > 0
 
     asyncio.run(_test())
@@ -155,9 +160,11 @@ def test_full_iteration_mock():
 
         orchestrator = ColocateOrchestrator(config)
 
+        # Mock所有组件
         mock_client = MockVLLMClient()
         orchestrator._vllm_client = mock_client
 
+        # Mock _do_inference
         async def mock_inference(batch):
             return [
                 ["Step 1: 5+3=8\n#### 8"] * config.num_samples_per_prompt
@@ -165,17 +172,21 @@ def test_full_iteration_mock():
             ]
         orchestrator._do_inference = mock_inference
 
+        # Mock _do_training
         async def mock_training(batch, responses, rewards):
             return MockTrainMetrics(step=orchestrator.step_count if hasattr(orchestrator, 'step_count') else 1)
         orchestrator._do_training = mock_training
 
+        # Mock _do_weight_sync
         async def mock_sync():
             pass
         orchestrator._do_weight_sync = mock_sync
 
+        # Mock reward function
         from src.reward.gsm8k_reward import GSM8KRewardFunction
         orchestrator._reward_fn = GSM8KRewardFunction()
 
+        # Mock data pipeline
         from src.data.data_pipeline import GRPOBatch
         mock_batches = [
             GRPOBatch(
@@ -185,6 +196,7 @@ def test_full_iteration_mock():
             )
         ]
 
+        # Mock data pipeline's get_batches
         class MockDataPipeline:
             def get_batches(self, batch_size):
                 return mock_batches
@@ -192,15 +204,19 @@ def test_full_iteration_mock():
                 return 2
         orchestrator._data_pipeline = MockDataPipeline()
 
+        # 标记初始化完成
         await orchestrator._transition(OrchestratorState.INIT)
 
+        # 运行循环
         metrics = await orchestrator.run()
 
+        # 验证
         assert len(metrics) == 2, f"Expected 2 iterations, got {len(metrics)}"
         assert orchestrator.state == OrchestratorState.DONE
         assert mock_client.sleep_calls == 2
         assert mock_client.wake_calls == 2
 
+        # 验证metrics结构
         for m in metrics:
             assert isinstance(m, IterationMetrics)
             assert m.total_time > 0
@@ -227,6 +243,7 @@ def test_get_summary_with_data():
     config = ColocateConfig(model_path="test-model", total_iterations=5)
     orchestrator = ColocateOrchestrator(config)
 
+    # 手动添加一些metrics
     for i in range(3):
         m = IterationMetrics(
             iteration=i,

@@ -101,6 +101,7 @@ class PrefixCache:
                 h.update(tid.to_bytes(4, byteorder='little', signed=False))
             return h.intdigest()
         else:
+            # Fallback: 使用 hashlib (较慢但可用)
             data = prev_hash.to_bytes(8, byteorder='little', signed=False)
             for tid in token_ids:
                 data += tid.to_bytes(4, byteorder='little', signed=False)
@@ -136,8 +137,10 @@ class PrefixCache:
             # 计算此 block 的哈希
             block_hash = self.compute_block_hash(block_tokens, prev_hash)
             
+            # 查找缓存
             cached = self._cache.get(block_hash)
             if cached is not None and tuple(block_tokens) == cached.token_ids:
+                # 命中！更新访问时间和引用计数
                 cached.last_access_time = time.time()
                 cached.ref_count += 1
                 matched_tokens += self.block_size
@@ -145,6 +148,7 @@ class PrefixCache:
                 prev_hash = block_hash
                 self.hits += 1
             else:
+                # 未命中，停止匹配
                 self.misses += 1
                 break
         else:
@@ -174,6 +178,7 @@ class PrefixCache:
             
             block_hash = self.compute_block_hash(block_tokens, prev_hash)
             
+            # 如果缓存已满，先淘汰
             if len(self._cache) >= self.max_cached_blocks and block_hash not in self._cache:
                 self.evict_lru(num_blocks=1)
             
@@ -205,9 +210,11 @@ class PrefixCache:
             ]
             
             if unreferenced:
+                # 按 last_access_time 排序, 淘汰最旧的
                 unreferenced.sort(key=lambda x: x[1].last_access_time)
                 victim_hash = unreferenced[0][0]
             else:
+                # 所有都有引用, 淘汰最旧的
                 all_entries = list(self._cache.items())
                 all_entries.sort(key=lambda x: x[1].last_access_time)
                 victim_hash = all_entries[0][0]

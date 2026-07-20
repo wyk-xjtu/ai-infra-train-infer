@@ -95,6 +95,7 @@ class ZeROOptimizer:
         self.params = list(params)
         self.param_count = sum(p.numel() for p in self.params)
 
+        # Step 1: 创建平坦化的参数 buffer（所有 rank 一致）
         # 对齐到 world_size 的整数倍（padding）
         # [显存优化] flat_params/flat_grad 使用模型参数的 dtype（bf16/fp16）而非 fp32
         # 这两个 buffer 仅用于通信（ReduceScatter/AllGather），不需要 fp32 精度
@@ -107,10 +108,12 @@ class ZeROOptimizer:
         # 将参数数据拷贝到 flat buffer
         self._copy_params_to_flat()
 
+        # Step 2: 计算每个 rank 负责的分片范围
         self.shard_size = self.padded_size // self.world_size
         self.shard_start = self.rank * self.shard_size
         self.shard_end = self.shard_start + self.shard_size
 
+        # Step 3: 为本地分片创建 optimizer
         # local_shard 使用 fp32（AdamW master weights 需要高精度）
         # 即使 flat_params 是 bf16，local_shard 仍转为 fp32
         self.local_shard = self.flat_params[self.shard_start:self.shard_end].clone().detach().float().requires_grad_(True)
@@ -168,12 +171,17 @@ class ZeROOptimizer:
         2. 本地 optimizer.step(): 用聚合梯度更新本地参数分片
         3. AllGather: 参数同步 → 所有 rank 恢复完整的更新后参数
         """
+        # Step 0: 收集所有参数梯度到 flat buffer
         self._collect_grads_to_flat()
 
         if self.world_size > 1 and self.group is not None:
+            # ============================================================
+            # Step 1: ReduceScatter 梯度
             # 输入: flat_grad [padded_size] (每个 rank 有自己的局部梯度)
+            # 输出: local_grad [shard_size] (当前 rank 负责部分的聚合梯度)
             # 效果等价于: AllReduce → 取自己负责的 shard
             # 但通信量减半: AllReduce = 2*(N-1)/N * data, ReduceScatter = (N-1)/N * data
+            # ============================================================
             local_grad = torch.empty(
                 self.shard_size, dtype=self._buffer_dtype, device=self.flat_grad.device
             )
@@ -188,7 +196,9 @@ class ZeROOptimizer:
             # 单卡模式：直接取对应分片
             local_grad = self.flat_grad[self.shard_start:self.shard_end].clone()
 
+        # Step 2: 本地优化器更新
         # 只更新当前 rank 负责的参数分片
+        # ============================================================
         # 直接原地拷贝梯度到 local_shard.grad（自动 dtype 转换，不创建中间 tensor）
         if self.local_shard.grad is None:
             self.local_shard.grad = torch.zeros_like(self.local_shard)
@@ -199,11 +209,16 @@ class ZeROOptimizer:
         self.flat_params[self.shard_start:self.shard_end].copy_(self.local_shard.data.to(self._buffer_dtype))
 
         if self.world_size > 1 and self.group is not None:
+            # ============================================================
+            # Step 3: AllGather 参数
+            # 每个 rank 广播自己更新后的 shard，所有 rank 恢复完整参数
+            # ============================================================
             dist.all_gather_into_tensor(
                 self.flat_params, self.flat_params[self.shard_start:self.shard_end].contiguous(),
                 group=self.group
             )
 
+        # Step 4: 将更新后的 flat_params 拷贝回模型参数
         self._copy_flat_to_params()
 
     def zero_grad(self):
@@ -223,6 +238,7 @@ class ZeROOptimizer:
         - 当前 rank 只管理 shard_size 个参数
         - 总占用 = shard_size * 2 * 4 bytes (fp32)
         """
+        # 统计 local_optimizer 的实际状态大小
         total_bytes = 0
         for state in self.local_optimizer.state.values():
             for v in state.values():

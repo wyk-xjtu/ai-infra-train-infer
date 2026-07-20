@@ -1,0 +1,9 @@
+benchmark:
+  model_path: "models/Qwen3-0.6B"
+  modes: ["eager", "kv_cache"]
+  num_prompts: 10
+  max_tokens: 128
+  warmup: 2
+  num_runs: 5
+  batch_size: 1
+  dtype: "bfloat16"

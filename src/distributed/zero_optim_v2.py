@@ -96,6 +96,7 @@ class ZeROStage2Optimizer:
             raise ValueError("ZeROStage2Optimizer: no trainable parameters found")
         self.param_count = sum(p.numel() for p in self.params)
 
+        # Step 1: 创建平坦化的参数 buffer（所有 rank 一致）
         # 对齐到 world_size 的整数倍（padding）
         # flat_params 使用模型参数的 dtype（bf16/fp16）用于通信
         # local_shard 保持 fp32（AdamW master weights 需要高精度）
@@ -107,10 +108,12 @@ class ZeROStage2Optimizer:
         # 将参数数据拷贝到 flat buffer
         self._copy_params_to_flat()
 
+        # Step 2: 计算每个 rank 负责的分片范围
         self.shard_size = self.padded_size // self.world_size
         self.shard_start = self.rank * self.shard_size
         self.shard_end = self.shard_start + self.shard_size
 
+        # Step 3: 为本地分片创建 optimizer
         # local_shard 使用 fp32（AdamW master weights 需要高精度）
         self.local_shard = self.flat_params[self.shard_start:self.shard_end].clone().detach().float().requires_grad_(True)
         self.local_optimizer = optimizer_class([self.local_shard], **optimizer_kwargs)
@@ -241,24 +244,30 @@ class ZeROStage2Optimizer:
         3. 写回模型参数
         4. 清零梯度累加器
         """
+        # Step 1: 将累积的梯度 shard 赋给 local_shard 并更新
         if self.local_shard.grad is None:
             self.local_shard.grad = torch.zeros_like(self.local_shard)
         self.local_shard.grad.copy_(self._local_grad_acc)  # fp32 → fp32 in-place
         self.local_optimizer.step()
 
+        # Step 2: 将更新后的 local shard (fp32) 写回 flat_params (bf16/fp16)
         self.flat_params[self.shard_start:self.shard_end].copy_(
             self.local_shard.data.to(self._buffer_dtype)
         )
 
         if self.world_size > 1 and self.group is not None:
+            # Step 3: AllGather 参数
+            # 每个 rank 广播自己更新后的 shard，所有 rank 恢复完整参数
             dist.all_gather_into_tensor(
                 self.flat_params,
                 self.flat_params[self.shard_start:self.shard_end].contiguous(),
                 group=self.group
             )
 
+        # Step 4: 将更新后的 flat_params 拷贝回模型参数
         self._copy_flat_to_params()
 
+        # Step 5: 清零梯度累加器，为下一轮准备
         self._local_grad_acc.zero_()
 
     def zero_grad(self):
@@ -292,18 +301,22 @@ class ZeROStage2Optimizer:
                            self._grad_count, len(self.params))
             self._reduce_scatter_grads()
 
+        # 1. NaN/Inf 检测
         if torch.isnan(self._local_grad_acc).any() or torch.isinf(self._local_grad_acc).any():
             logger.warning("NaN/Inf detected in ZeRO-2 local gradients")
             return -1.0
 
+        # 2. 计算本 rank 的局部梯度范数平方
         local_norm_sq = self._local_grad_acc.float().norm(2).item() ** 2
         total_norm_sq = torch.tensor(local_norm_sq, device=self._local_grad_acc.device)
 
+        # 3. AllReduce 聚合全局范数（所有 rank 的 shard 范数之和 = 全局范数）
         if self.world_size > 1 and self.group is not None:
             dist.all_reduce(total_norm_sq, op=dist.ReduceOp.SUM, group=self.group)
 
         total_norm = total_norm_sq.sqrt().item()
 
+        # 4. 裁剪
         clip_coef = max_norm / (total_norm + 1e-6)
         if clip_coef < 1.0:
             self._local_grad_acc.mul_(clip_coef)

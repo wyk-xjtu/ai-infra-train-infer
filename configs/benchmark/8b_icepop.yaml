@@ -1,0 +1,91 @@
+# 8B IcePop Only - 8x H20, TP=2, DP=4
+experiment:
+  name: "8b_icepop_only"
+  stage: "rl"
+  algorithm: "grpo"
+  seed: 42
+  output_dir: "outputs/rl/8b_icepop"
+
+runtime:
+  device: "auto"
+  precision: "bf16"
+  tp_size: 2
+  dp_size: 4
+  inference_backend: "custom"
+  deterministic: false
+
+model:
+  name_or_path: "./models/Qwen3-8B"
+  max_seq_len: 2048
+  use_flash_attn: false
+  attention_backend: "sdpa"
+
+data:
+  dataset_name: "./data/gsm8k"
+  dataset_config: null
+  split: "train"
+  max_samples: 200
+  prompt_template: "qwen3_math"
+
+rollout:
+  num_samples_per_prompt: 2
+  max_tokens: 256
+  temperature: 0.7
+  top_p: 0.95
+
+reward:
+  type: "gsm8k_rule"
+  answer_format: "#### {answer}"
+  correct_reward: 1.0
+  format_reward: -0.5
+  wrong_reward: -1.0
+
+training:
+  mode: "grpo"
+  total_iterations: 10
+  batch_size: 4
+  train_steps_per_iteration: 1
+  gradient_accumulation_steps: 1
+  learning_rate: 1.0e-5
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  grpo_beta: 0.1
+  grpo_clip_eps: 0.2
+
+lora:
+  enabled: true
+  rank: 8
+  alpha: 16
+  dropout: 0.0
+  target_modules: ["q_proj","k_proj","v_proj","o_proj","gate_proj","up_proj","down_proj"]
+
+checkpoint:
+  save_dir: "checkpoints/rl/8b_icepop"
+  save_interval: 100
+  resume_from: null
+
+eval:
+  num_prompts: 0
+  max_tokens: 256
+
+icepop:
+  enabled: true
+  divergence_threshold: 0.5
+  max_mask_ratio: 0.5
+  log_diagnostics: true
+
+c3po_plus:
+  enabled: false
+  token_budget: 1024
+  target_batch_tokens: 4096
+  packing_strategy: "ffd"
+
+swift_sync:
+  enabled: false
+  fallback_full_every: 10
+  double_buffer: true
+
+async_pipeline:
+  enabled: false
+  max_staleness: 2
+  queue_size: 2

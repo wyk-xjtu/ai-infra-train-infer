@@ -23,12 +23,14 @@ import torch
 class InferenceContext:
     """推理上下文数据 — Attention 层执行时所需的全部元信息"""
     is_prefill: bool = False
+    # Prefill 专用: 变长序列的 cumulative sequence lengths
     cu_seqlens_q: Optional[torch.Tensor] = None
     cu_seqlens_k: Optional[torch.Tensor] = None
     max_seqlen_q: int = 0
     max_seqlen_k: int = 0
     # 通用: token → 物理 slot 映射 (用于写入 KV Cache)
     slot_mapping: Optional[torch.Tensor] = None
+    # Decode 专用: 每个序列的上下文长度 (历史 token 数)
     context_lens: Optional[torch.Tensor] = None
     # 通用: block_table 用于从 cache 读取历史 KV
     block_tables: Optional[torch.Tensor] = None

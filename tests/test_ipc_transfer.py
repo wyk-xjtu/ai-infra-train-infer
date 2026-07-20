@@ -41,9 +41,11 @@ def test_transfer_stats():
 
 def test_chunk_handles():
     """测试分块逻辑"""
+    # 创建mock VLLMClient
     mock_client = MagicMock()
     transfer = IPCWeightTransfer(vllm_client=mock_client, chunk_size=4)
 
+    # 创建测试handles
     import torch
     handles = [
         IPCHandle(
@@ -56,6 +58,7 @@ def test_chunk_handles():
         for i in range(10)
     ]
 
+    # 测试分块
     chunks = transfer._chunk_handles(handles)
 
     assert len(chunks) == 3, f"Expected 3 chunks, got {len(chunks)}"
@@ -71,6 +74,7 @@ def test_vllm_client_health_check():
     async def _test():
         client = VLLMClient(base_url="http://localhost:9999", timeout=2)
 
+        # Mock httpx client
         mock_response = MagicMock()
         mock_response.status_code = 200
 
@@ -93,6 +97,7 @@ def test_vllm_client_sleep_wake():
     async def _test():
         client = VLLMClient(base_url="http://localhost:9999", timeout=2)
 
+        # Mock httpx client
         mock_response = MagicMock()
         mock_response.status_code = 200
         mock_response.json = MagicMock(return_value={"status": "ok"})
@@ -102,9 +107,11 @@ def test_vllm_client_sleep_wake():
         mock_httpx_client.get = AsyncMock(return_value=mock_response)
         client._client = mock_httpx_client
 
+        # Test sleep
         result = await client.sleep(level=1)
         assert result is True
 
+        # Test wake_up
         result = await client.wake_up(tags=["weights", "kv_cache"])
         assert result is True
 
@@ -119,6 +126,7 @@ def test_vllm_client_weight_update_protocol():
     async def _test():
         client = VLLMClient(base_url="http://localhost:9999", timeout=2)
 
+        # Mock
         mock_response = MagicMock()
         mock_response.status_code = 200
         mock_response.json = MagicMock(return_value={"status": "ok"})
@@ -127,11 +135,13 @@ def test_vllm_client_weight_update_protocol():
         mock_httpx_client.post = AsyncMock(return_value=mock_response)
         client._client = mock_httpx_client
 
+        # 执行完整协议
         await client.init_weight_transfer()
         await client.start_weight_update(is_checkpoint_format=True)
         await client.update_weights({"names": ["test"], "shapes": [[64, 64]]})
         await client.finish_weight_update()
 
+        # 验证调用次数
         assert mock_httpx_client.post.call_count == 4
         await client.close()
 

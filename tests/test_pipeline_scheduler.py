@@ -32,6 +32,9 @@ from src.distributed.pipeline_scheduler import PipelineScheduler, default_loss_f
 import torch.distributed as dist
 
 
+# ------------------------------------------------------------------
+# toy config（小到可在单卡快速跑）
+# ------------------------------------------------------------------
 CFG = dict(
     vocab_size=128,
     hidden_size=64,
@@ -76,6 +79,9 @@ def _local_to_global_key(key, offset):
     return key
 
 
+# ------------------------------------------------------------------
+# mode = stage
+# ------------------------------------------------------------------
 def test_stage_model():
     ctx = ParallelContext.init_distributed(tp_size=1, dp_size=1, pp_size=2, backend="nccl")
     rank = ctx.rank
@@ -91,6 +97,7 @@ def test_stage_model():
     if ppc.is_first_stage:
         assert model.embed_tokens is not None, "first stage must hold embed_tokens"
         assert model.norm is None and model.lm_head is None, "first stage must NOT hold norm/lm_head"
+        # forward: tokens -> hidden
         ids = torch.randint(0, CFG["vocab_size"], (MBS, SEQ), device=device)
         out = model(ids)
         assert out.shape == (MBS, SEQ, CFG["hidden_size"]), f"first stage out {out.shape}"
@@ -98,6 +105,7 @@ def test_stage_model():
     else:
         assert model.embed_tokens is None, "last stage must NOT hold embed_tokens"
         assert model.norm is not None and model.lm_head is not None, "last stage must hold norm+lm_head"
+        # forward: hidden -> logits
         hidden = torch.randn(MBS, SEQ, CFG["hidden_size"], device=device)
         out = model(hidden)
         assert out.shape == (MBS, SEQ, CFG["vocab_size"]), f"last stage out {out.shape}"
@@ -108,6 +116,9 @@ def test_stage_model():
         print("  ✓ test_stage_model passed")
 
 
+# ------------------------------------------------------------------
+# mode = equiv
+# ------------------------------------------------------------------
 def test_equivalence():
     ctx = ParallelContext.init_distributed(tp_size=1, dp_size=1, pp_size=2, backend="nccl")
     rank = ctx.rank
@@ -116,6 +127,7 @@ def test_equivalence():
 
     batches = _gen_batches(device)
 
+    # ---- 参考：单进程 full model（pp=1 语义），逐 micro-batch 前后向累积 ----
     ref_ctx = ParallelContext(tp_size=1, tp_group=None)  # 无分布式，comm no-op
     full_model = _build_model(ref_ctx, None, device)  # pp_context=None → 完整模型
     full_model.zero_grad(set_to_none=True)
@@ -126,6 +138,7 @@ def test_equivalence():
         ref_loss = ref_loss + l.detach()
         l.backward()
 
+    # ---- pp=2 stage model：从 full model 复制对应权重 ----
     stage_model = _build_model(ctx, ppc, device)
     offset = stage_model.stage_start
     full_sd = full_model.state_dict()
@@ -138,6 +151,7 @@ def test_equivalence():
     scheduler = PipelineScheduler(ppc, num_micro_batches=NUM_MICRO, loss_fn=default_loss_fn)
     sched_loss = scheduler.run_1f1b_schedule(stage_model, iter(batches))
 
+    # ---- 断言 1：末 stage loss 等价（<1%）----
     if ppc.is_last_stage:
         assert sched_loss is not None, "last stage must return accumulated loss"
         ref = ref_loss.item()
@@ -149,11 +163,13 @@ def test_equivalence():
         assert sched_loss is None, "non-last stage must return None"
         print(f"  [rank {rank}] FIRST stage loss=None (as expected)")
 
+    # ---- 断言 2：p.grad 非 None（梯度确实回传）----
     none_grads = [n for n, p in stage_model.named_parameters() if p.requires_grad and p.grad is None]
     assert not none_grads, f"[rank {rank}] params with grad=None: {none_grads}"
     n_params = sum(1 for _ in stage_model.parameters())
     print(f"  [rank {rank}] all {n_params} params have grad (梯度回传✓)")
 
+    # ---- 断言 3：grad 与 full model 对应参数接近（强化等价）----
     full_named = dict(full_model.named_parameters())
     max_grad_diff = 0.0
     for n, p in stage_model.named_parameters():
@@ -169,6 +185,9 @@ def test_equivalence():
         print("  ✓ test_equivalence passed (loss 等价 + 梯度回传 + grad 匹配)")
 
 
+# ------------------------------------------------------------------
+# Entry
+# ------------------------------------------------------------------
 if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) > 1 else "stage"
     is_rank0 = int(os.environ.get("RANK", "0")) == 0
